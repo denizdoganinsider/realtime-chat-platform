@@ -100,8 +100,79 @@ WebSocket are working together end to end.
 
 ## Roadmap (not yet implemented)
 
-- **Month 2**: Presence Service (online/typing), message persistence + history.
-- **Month 3**: Load Balancer — multiple chat-service instances behind the
-  gateway, round-robin/least-conn, and the WebSocket sticky-session problem.
-- **Month 4**: Notification Service (webhooks, carried over from
-  notification-api), CDN-style edge caching for shared media.
+### Month 2 — Presence Service + persistence
+
+New service: **presence-service** (`:8002`), backed by **Redis** (TTL-based
+online/typing state — the first real Caching usage in this project, vs.
+month 1 which touched no cache at all).
+
+- `chat-service` gains a MySQL `messages` table (`room_id`, `user_id`,
+  `content`, `created_at`) and a `GET /rooms/:room/messages` history
+  endpoint (paginated, same pattern as notification-api's
+  `notification_repository.go`). Broadcast stays in-memory; persistence is
+  additive, not a replacement.
+- On join/leave, `chat-service` **POSTs an event to presence-service**
+  (`user_id`, `room`, `status`) — reusing the webhook-delivery pattern from
+  notification-api (retry/backoff) instead of a new mechanism, since it's
+  already-learned material applied to a new problem.
+- Typing indicators are ephemeral WS messages (`type: "typing"`) — never
+  persisted, never proxied through presence-service's HTTP API.
+- `gateway` adds a third proxy target: `GET /presence/:room` → presence-service.
+- **Verification**: two clients join a room, confirm `GET /presence/:room`
+  shows both as online; one disconnects, confirm presence flips within the
+  TTL window without an explicit "leave" message (crash/network-drop case).
+
+### Month 3 — Load Balancer
+
+Run **multiple chat-service instances** (`:8001`, `:8011`, ...) behind the
+gateway. This is where the WebSocket **sticky-session problem** becomes
+unavoidable: `chat-service`'s `Hub` is in-memory and per-process (see month
+1's `hub.go` comment), so two clients in the same room MUST land on the
+same instance or they can't see each other's messages.
+
+- `gateway/internal/loadbalancer/`: a small pluggable LB with two
+  strategies —
+  - **round-robin** for stateless requests (`/register`, `/login`, `/rooms`
+    listing — any instance can answer since presence-service, not
+    chat-service, is the source of truth for room metadata by month 3).
+  - **consistent hashing on the `room` query param** for `/ws` — the same
+    room name always resolves to the same chat-service instance, which
+    solves the sticky-session problem *without* needing shared state
+    between instances (the trade-off explained explicitly: this is the
+    "cheap" fix; the "real" fix — a Redis pub/sub backplane so any
+    instance can serve any room — is called out as a stretch goal, not
+    built, to keep the lesson about load balancing rather than distributed
+    broadcast).
+- Basic **health checking**: gateway polls each instance's `/health` on an
+  interval and routes around a dead one; if the room's hashed instance is
+  down, that room's connections fail closed (documented, not silently
+  rerouted — rerouting would silently break the sticky guarantee).
+- **Verification**: start 2 chat-service instances, confirm two clients in
+  the same room always hit the same instance (log the `request_id` +
+  instance port on both proxy and backend to prove it); kill one instance
+  mid-session and confirm only the rooms hashed to it are affected.
+
+### Month 4 — Notification Service + CDN
+
+- **notification-service** (`:8003`): carries the webhook-delivery
+  machinery over from notification-api almost directly — when a message
+  arrives for a user who is offline (per presence-service), deliver a
+  webhook/push event to that user's registered endpoint, with the same
+  retry/exponential-backoff service already built once in month 1 of that
+  project. This is the one component with the least new code — the point
+  is recognizing an already-solved problem, not re-solving it.
+- **CDN-style edge caching** for shared media (avatars, attachments): a
+  small **media-service** (`:8004`) storing files on local disk, fronted by
+  an in-memory "edge cache" layer in the gateway keyed by content hash —
+  `ETag`, `Cache-Control: immutable`, and conditional `GET` (`304`) support.
+  Not a real multi-region CDN (out of scope for a single machine), but the
+  actual HTTP mechanics a CDN relies on: content-addressed caching,
+  cache-hit/miss headers, and immutable-content invalidation-by-URL rather
+  than invalidation-by-purge.
+- **Verification**: upload an avatar, confirm the second `GET` for the same
+  content hash returns `304` and a cache-hit log line at the gateway
+  without a round-trip to media-service.
+
+Each month's plan will be fleshed out into its own implementation plan
+(scope, files, verification) right before that month starts, the same way
+month 1 was — this section is the standing outline, not the final word.
