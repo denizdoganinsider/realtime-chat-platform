@@ -11,6 +11,8 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+const maxMessageSize = 8 * 1024 // 8KB - generous for a chat text message
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -50,6 +52,10 @@ func (h *Handler) Serve(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	// Without this, gorilla/websocket has no message-size cap: a single
+	// oversized frame gets fully buffered in memory before ever reaching
+	// the JSON-decode/drop-on-malformed check in Room.run.
+	conn.SetReadLimit(maxMessageSize)
 
 	room := h.hub.GetOrCreateRoom(roomName)
 	client := NewClient(conn, room, claims.UserID)

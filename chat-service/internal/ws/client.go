@@ -34,7 +34,17 @@ func NewClient(conn *websocket.Conn, room *Room, userID int64) *Client {
 // room's broadcast channel. Runs until the connection closes.
 func (c *Client) readPump() {
 	defer func() {
-		c.room.unregister <- c
+		// Bounded, not a bare blocking send: Room.run() can have already
+		// exited (Hub's reaper closed r.done - see hub.go) by the time
+		// this deferred send runs, e.g. if broadcastEvent already evicted
+		// this client as a slow consumer and emptied the room. An
+		// unbounded send here would leak this goroutine forever; same
+		// reasoning as the bounded register send in Handler.Serve.
+		select {
+		case c.room.unregister <- c:
+		case <-time.After(2 * time.Second):
+			slog.Warn("failed to unregister client: room unavailable", "user_id", c.userID)
+		}
 		c.conn.Close()
 	}()
 
@@ -76,11 +86,13 @@ func (c *Client) writePump() {
 			}
 
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				slog.Warn("websocket write error", "user_id", c.userID, "error", err)
 				return
 			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				slog.Warn("websocket ping error", "user_id", c.userID, "error", err)
 				return
 			}
 		}

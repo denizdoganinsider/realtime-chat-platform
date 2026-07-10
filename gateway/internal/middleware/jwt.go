@@ -9,10 +9,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-var JwtSecret []byte
+var jwtSecret []byte
 
 func InitJWT(secret string) {
-	JwtSecret = []byte(secret)
+	jwtSecret = []byte(secret)
 }
 
 func GenerateToken(userID int64, role string) (string, error) {
@@ -24,7 +24,7 @@ func GenerateToken(userID int64, role string) (string, error) {
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
-	return token.SignedString(JwtSecret)
+	return token.SignedString(jwtSecret)
 }
 
 func JWTMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
@@ -44,7 +44,7 @@ func JWTMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			return JwtSecret, nil
+			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
 			return c.JSON(http.StatusUnauthorized, map[string]string{
