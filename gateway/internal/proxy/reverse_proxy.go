@@ -11,12 +11,12 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// NewChatServiceProxy builds a reverse proxy in front of chat-service.
+// NewServiceProxy builds a reverse proxy in front of one backend service.
 // net/http/httputil.ReverseProxy transparently proxies WebSocket upgrade
 // requests too: it detects the Connection: Upgrade header, hijacks the
 // underlying TCP connection, and pipes bytes both ways - no extra code
 // needed for /ws specifically.
-func NewChatServiceProxy(targetURL string) (echo.HandlerFunc, error) {
+func NewServiceProxy(targetURL string) (echo.HandlerFunc, error) {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err

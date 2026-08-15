@@ -11,8 +11,14 @@ import (
 	"time"
 
 	"realtime-chat-platform/chat-service/config"
-	chatMiddleware "realtime-chat-platform/chat-service/internal/middleware"
+	"realtime-chat-platform/chat-service/internal/controller"
+	"realtime-chat-platform/chat-service/internal/dispatch"
+	"realtime-chat-platform/chat-service/internal/domain"
+	"realtime-chat-platform/chat-service/internal/repository"
+	"realtime-chat-platform/chat-service/internal/service"
 	"realtime-chat-platform/chat-service/internal/ws"
+
+	chatMiddleware "realtime-chat-platform/chat-service/internal/middleware"
 
 	"github.com/labstack/echo/v4"
 )
@@ -24,18 +30,43 @@ func main() {
 	cfg := config.LoadConfig()
 	chatMiddleware.InitJWT(cfg.JWTSecret)
 
-	hub := ws.NewHub()
+	db := config.NewDatabase(cfg)
+	defer db.Close()
+
+	messageRepo := repository.NewMessageRepository(db)
+	messageService := service.NewMessageService(messageRepo)
+	messageController := controller.NewMessageController(messageService)
+
+	presenceClient := service.NewPresenceClient(cfg.PresenceServiceURL, cfg.PresenceAPIKey)
+
+	// Deferred calls run last-in-first-out, so this reads bottom-up at exit: the
+	// hub stops first, then the heartbeat, then the dispatcher drains whatever
+	// the rooms queued on their way out.
+	dispatcher := dispatch.NewDispatcher(presenceClient, messageService)
+	defer dispatcher.Close(5 * time.Second)
+
+	hub := ws.NewHub(dispatcher, dispatcher)
 	defer hub.Close()
 
-	handler := ws.NewHandler(hub)
+	heartbeat := service.NewPresenceHeartbeat(presenceClient, hub,
+		time.Duration(cfg.PresenceHeartbeatSecs)*time.Second)
+	defer heartbeat.Close()
+
+	handler := ws.NewHandler(hub, cfg.WSAllowedOrigins)
 
 	e := echo.New()
+
+	// Request ids only, deliberately no request logger: /ws carries a token in
+	// its query string, and the surest way to keep it out of the logs is for
+	// this service to write no request logs at all. See README.
+	e.Use(chatMiddleware.RequestIDMiddleware)
 
 	e.GET("/health", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	e.GET("/rooms", handler.ListRooms, chatMiddleware.JWTMiddleware)
+	e.GET("/rooms/:room/messages", messageController.ListByRoom, chatMiddleware.JWTMiddleware)
 	e.GET("/ws", handler.Serve)
 
 	go func() {
@@ -47,6 +78,16 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+
+	// Mark everyone offline before going away. Nothing forces this - the TTL
+	// would expire them eventually - but it is the difference the README's
+	// verification turns on: a graceful stop clears presence at once, while a
+	// kill -9 leaves the TTL as the only thing that can.
+	for _, room := range hub.Snapshot() {
+		for _, userID := range room.UserIDs {
+			dispatcher.Notify(room.Name, userID, domain.PresenceStatusOffline)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

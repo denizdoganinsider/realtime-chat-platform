@@ -11,15 +11,19 @@ const reapInterval = 30 * time.Second
 // is what a Load Balancer will need to be sticky-session-aware about:
 // a client must keep talking to the instance holding its Room.
 type Hub struct {
-	mu    sync.Mutex
-	rooms map[string]*Room
-	stop  chan struct{}
+	mu       sync.Mutex
+	rooms    map[string]*Room
+	stop     chan struct{}
+	presence PresenceNotifier
+	archiver MessageArchiver
 }
 
-func NewHub() *Hub {
+func NewHub(presence PresenceNotifier, archiver MessageArchiver) *Hub {
 	h := &Hub{
-		rooms: make(map[string]*Room),
-		stop:  make(chan struct{}),
+		rooms:    make(map[string]*Room),
+		stop:     make(chan struct{}),
+		presence: presence,
+		archiver: archiver,
 	}
 
 	go h.reapEmptyRooms()
@@ -66,11 +70,31 @@ func (h *Hub) GetOrCreateRoom(name string) *Room {
 
 	room, ok := h.rooms[name]
 	if !ok {
-		room = NewRoom(name)
+		room = NewRoom(name, h.presence, h.archiver)
 		h.rooms[name] = room
 	}
 
 	return room
+}
+
+// RoomSnapshot is who is connected right now, per room. It is what the presence
+// heartbeat re-asserts to presence-service each interval, and what a graceful
+// shutdown walks to mark everyone offline before the process exits.
+type RoomSnapshot struct {
+	Name    string
+	UserIDs []int64
+}
+
+func (h *Hub) Snapshot() []RoomSnapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	snapshot := make([]RoomSnapshot, 0, len(h.rooms))
+	for name, room := range h.rooms {
+		snapshot = append(snapshot, RoomSnapshot{Name: name, UserIDs: room.UserIDs()})
+	}
+
+	return snapshot
 }
 
 type RoomInfo struct {

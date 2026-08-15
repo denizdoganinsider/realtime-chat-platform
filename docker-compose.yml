@@ -13,12 +13,31 @@ services:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/init.sql
+      # Applied in alphabetical order, and only when the data directory is empty.
+      # Each service owns its own schema - see db/chat_schema.sql for how to apply
+      # it to an already-initialised volume without losing registered users.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-gateway.sql
+      - ./db/chat_schema.sql:/docker-entrypoint-initdb.d/02-chat.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  redis:
+    image: redis:7
+    container_name: chat_redis
+    restart: no
+    # Host port 6380, not 6379: the sibling notification-api compose already binds
+    # 6379, and this repo already picked 3307 for MySQL for the same reason - both
+    # learning projects should run side by side.
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   mysql_data:

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,11 @@ import (
 )
 
 var jwtSecret []byte
+
+// Context keys the handlers read back out, named here rather than spelled as
+// string literals at each use site.
+const UserIDKey = "user_id"
+const RoleKey = "role"
 
 func InitJWT(secret string) {
 	jwtSecret = []byte(secret)
@@ -44,6 +50,15 @@ func JWTMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			// Confirm the algorithm rather than trusting the token's own header:
+			// without this, the keyfunc hands the HMAC secret to whatever method
+			// the token asks for. Not exploitable while everything here is HMAC,
+			// but it is the footgun that arms itself the day an asymmetric key
+			// appears.
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+
 			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
@@ -68,8 +83,8 @@ func JWTMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 
 		role, _ := claims["role"].(string)
 
-		c.Set("user_id", int64(userIDFloat))
-		c.Set("role", role)
+		c.Set(UserIDKey, int64(userIDFloat))
+		c.Set(RoleKey, role)
 
 		return next(c)
 	}

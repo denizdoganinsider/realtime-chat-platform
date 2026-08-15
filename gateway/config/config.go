@@ -6,14 +6,15 @@ import (
 )
 
 type Config struct {
-	DBHost         string
-	DBPort         string
-	DBUser         string
-	DBPassword     string
-	DBName         string
-	JWTSecret      string
-	ServerPort     string
-	ChatServiceURL string
+	DBHost             string
+	DBPort             string
+	DBUser             string
+	DBPassword         string
+	DBName             string
+	JWTSecret          string
+	ServerPort         string
+	ChatServiceURL     string
+	PresenceServiceURL string
 }
 
 func LoadConfig() *Config {
@@ -26,6 +27,8 @@ func LoadConfig() *Config {
 		JWTSecret:      requireEnv("JWT_SECRET"),
 		ServerPort:     getEnv("SERVER_PORT", "8000"),
 		ChatServiceURL: getEnv("CHAT_SERVICE_URL", "http://localhost:8001"),
+
+		PresenceServiceURL: getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
 	}
 }
 
