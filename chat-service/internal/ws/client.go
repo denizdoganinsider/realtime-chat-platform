@@ -63,7 +63,14 @@ func (c *Client) readPump() {
 			break
 		}
 
-		c.room.broadcast <- broadcastMessage{from: c, payload: payload}
+		// Bounded for the same reason as the unregister send above: the room
+		// this client holds a pointer to can already have been shut down, and a
+		// bare send would then block this goroutine forever.
+		select {
+		case c.room.broadcast <- broadcastMessage{from: c, payload: payload}:
+		case <-time.After(2 * time.Second):
+			slog.Warn("dropping message: room unavailable", "user_id", c.userID)
+		}
 	}
 }
 

@@ -36,9 +36,19 @@ func main() {
 	userService := service.NewUserService(userRepo)
 	authController := controller.NewAuthController(userService)
 
-	chatProxy, err := proxy.NewChatServiceProxy(cfg.ChatServiceURL)
+	ticketService := service.NewTicketService()
+	defer ticketService.Close()
+	ticketController := controller.NewTicketController(ticketService)
+
+	chatProxy, err := proxy.NewServiceProxy(cfg.ChatServiceURL)
 	if err != nil {
 		slog.Error("failed to build chat-service proxy", "error", err)
+		os.Exit(1)
+	}
+
+	presenceProxy, err := proxy.NewServiceProxy(cfg.PresenceServiceURL)
+	if err != nil {
+		slog.Error("failed to build presence-service proxy", "error", err)
 		os.Exit(1)
 	}
 
@@ -57,14 +67,26 @@ func main() {
 	auth := e.Group("")
 	auth.Use(gatewayMiddleware.JWTMiddleware)
 	auth.GET("/me", authController.Me)
+	auth.POST("/ws-ticket", ticketController.Issue)
 
 	// Reverse-proxied to chat-service. /rooms requires the same Bearer
-	// token as /me (chat-service re-validates it independently). /ws
-	// carries the JWT as a query param instead, since browser WebSocket
-	// clients cannot set custom headers on the handshake - chat-service
-	// validates it there.
+	// token as /me (chat-service re-validates it independently).
 	auth.GET("/rooms", chatProxy)
-	e.GET("/ws", chatProxy)
+	// Echo matches routes exactly, so /rooms does not cover /rooms/:room/messages.
+	auth.GET("/rooms/:room/messages", chatProxy)
+
+	// /ws is not in the auth group: a browser cannot put a Bearer token on a
+	// WebSocket handshake. It presents a one-shot ticket instead, which this
+	// middleware exchanges for an Authorization header on the proxied request -
+	// something the gateway can set even though the browser cannot.
+	e.GET("/ws", chatProxy, gatewayMiddleware.WSTicketMiddleware(ticketService))
+
+	// The gateway is the only public entry point, so presence-service's
+	// end-user read path is reachable through it and nowhere else. No path
+	// rewriting is needed: the target URL carries no path, so /presence/general
+	// is joined unchanged, and the caller's Authorization header is forwarded
+	// as-is for presence-service to validate independently.
+	auth.GET("/presence/:room", presenceProxy)
 
 	go func() {
 		if err := e.Start(fmt.Sprintf(":%s", cfg.ServerPort)); err != nil && err != http.ErrServerClosed {

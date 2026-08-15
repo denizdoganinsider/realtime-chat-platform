@@ -75,7 +75,7 @@ func (ac *AuthController) Login(c echo.Context) error {
 }
 
 func (ac *AuthController) Me(c echo.Context) error {
-	userID, ok := c.Get("user_id").(int64)
+	userID, ok := c.Get(middleware.UserIDKey).(int64)
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}

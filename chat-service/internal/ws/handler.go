@@ -3,9 +3,12 @@ package ws
 import (
 	"log/slog"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	chatMiddleware "realtime-chat-platform/chat-service/internal/middleware"
+	"realtime-chat-platform/chat-service/internal/validation"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -13,42 +16,66 @@ import (
 
 const maxMessageSize = 8 * 1024 // 8KB - generous for a chat text message
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Month 1 scope: any origin allowed. A real deployment would check
-	// this against a configured allowlist.
-	CheckOrigin: func(r *http.Request) bool { return true },
+// NewUpgrader builds the WebSocket upgrader with an Origin allowlist.
+//
+// A missing Origin header is allowed and a present one must match: cross-site
+// WebSocket hijacking is a browser attack, and browsers always send Origin and
+// cannot be told not to. Native clients (websocat, mobile, the verification
+// script) send none, and rejecting them would buy no security at all.
+func NewUpgrader(allowedOrigins []string) websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+
+			return slices.Contains(allowedOrigins, origin)
+		},
+	}
 }
 
 type Handler struct {
-	hub *Hub
+	hub      *Hub
+	upgrader websocket.Upgrader
 }
 
-func NewHandler(hub *Hub) *Handler {
-	return &Handler{hub: hub}
+func NewHandler(hub *Hub, allowedOrigins []string) *Handler {
+	return &Handler{
+		hub:      hub,
+		upgrader: NewUpgrader(allowedOrigins),
+	}
 }
 
-// Serve handles GET /ws?room=<name>&token=<jwt>. Browsers cannot set
-// custom headers on the WebSocket handshake, so the JWT travels as a
-// query param here instead of the Authorization header used elsewhere.
+// Serve handles GET /ws?room=<name>. The token arrives in the Authorization
+// header: the client presents a one-shot ticket to the gateway, which redeems it
+// and sets the header on the request it proxies here. Browsers cannot set
+// headers on a handshake, but the gateway can on its outbound request - so no
+// credential ever travels in a URL.
 func (h *Handler) Serve(c echo.Context) error {
 	roomName := c.QueryParam("room")
 	if roomName == "" {
 		roomName = "general"
 	}
 
-	token := c.QueryParam("token")
-	if token == "" {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing token"})
+	if err := validation.ValidateRoomName(roomName); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	claims, err := chatMiddleware.ValidateToken(token)
+	authHeader := c.Request().Header.Get("Authorization")
+	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	if authHeader == "" || tokenString == authHeader {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "missing or invalid authorization header"})
+	}
+
+	claims, err := chatMiddleware.ValidateToken(tokenString)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
 	}
 
-	conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	conn, err := h.upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
 		return err
 	}
