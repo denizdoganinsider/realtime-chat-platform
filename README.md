@@ -156,7 +156,10 @@ cd gateway && JWT_SECRET=my-secret-key GATEWAY_SHARED_KEY=dev-gateway-key \
 ```
 
 chat-service also needs `NOTIFICATION_API_KEY=dev-notification-key` from month
-4 on (omitted above for width).
+4 on (omitted above for width). **Upgrading a running months 1-3 setup:** set
+`GATEWAY_SHARED_KEY` (gateway) and `NOTIFICATION_API_KEY` (chat-service) in
+the environment *before* restarting either binary — both are required with no
+default, and a binary rolled ahead of its config exits at startup.
 
 Every secret has **no default** — a service that needs one fails fast at
 startup if it is unset, on purpose: a predictable default would let anyone
@@ -627,9 +630,17 @@ Two things the predecessor did not have to think about:
   to whatever is registered, from inside the network, with a service identity.
   A URL pointing at localhost, a private range or the link-local metadata
   address is a request to use notification-service as a proxy into things the
-  user cannot reach themselves. Loopback is allowed only with
-  `WEBHOOK_ALLOW_LOOPBACK=true`, because the local receiver in the
-  verification below runs on it.
+  user cannot reach themselves. The string check at registration is a
+  courtesy (a `400` now rather than a failed delivery later); the check that
+  holds is in the HTTP transport, which resolves the hostname itself at every
+  delivery and refuses to dial any forbidden address — because what a name
+  resolves to is decided by whoever controls its DNS, not by the string
+  (`ssrf.go`). Loopback is allowed only with `WEBHOOK_ALLOW_LOOPBACK=true`,
+  because the local receiver in the verification below runs on it.
+- **Shutdown drains.** Every event answered `202` gets its fan-out (so its
+  rows exist) and queued deliveries are attempted, within a budget; past it
+  the context is cancelled, in-flight retries end at once and are recorded as
+  failed. Nothing accepted disappears without a row or a log line.
 
 On the chat-service side, the room's one `Archive` call now fans into two
 queues — the database write and the message event — and the room does not
@@ -667,9 +678,15 @@ flush everything else for a single hit. On a miss it fetches the full object
 from media-service — even when the client sent `If-None-Match`, because
 forwarding the condition would yield a bodiless `304` and nothing to keep —
 stores it, and then answers the client's condition. On a hit, or a conditional
-hit, the origin never hears about the request. `X-Cache: HIT|MISS` says which
-happened; only a `200` whose `Cache-Control` says `immutable` is kept, so the
-origin decides what is cacheable and the edge obeys.
+hit, the origin never hears about the request. Concurrent misses for one hash
+coalesce onto a single origin fetch — fifty clients asking for a freshly
+linked avatar is one round trip, not fifty copies in memory. `X-Cache` says
+what happened: `HIT`, `MISS`, or `BYPASS` for an object the edge will not hold
+(over the per-object cap, or not marked immutable by the origin), which is
+streamed through uncached rather than turned into a permanent `502` because
+two services' size limits disagree. Only a `200` with an `ETag` and
+`Cache-Control: immutable` is kept: the origin decides what is cacheable and
+the edge obeys.
 
 Not a multi-region CDN — one process, one machine — but the HTTP mechanics a
 CDN runs on, including the one that matters most: there is no purge. Invalid
@@ -736,10 +753,10 @@ One origin fetch, however many reads: that is the line the roadmap asked for.
 - **Webhook secrets are stored in the clear.** Signing needs the value, not a
   hash of it. The secret protects the receiver from forged calls; it does not
   protect the `webhooks` table, and a real deployment encrypts that column.
-- **The delivery queue is in memory.** A crash loses whatever was queued;
-  the rows stay `pending` and say so. A durable outbox (poll the table for due
-  rows) is the next step and is exactly what notification-api did not have
-  either.
+- **The delivery queue is in memory.** A graceful stop drains it; a crash
+  loses whatever was queued, and rows that reached fan-out stay `pending` and
+  say so. A durable outbox (poll the table for due rows) is the next step and
+  is exactly what notification-api did not have either.
 - **The edge cache is per gateway process.** Two gateways are two caches. A
   real CDN's edges are also independent — that is the point of a CDN — but
   they share an origin shield, and this one has no such tier.

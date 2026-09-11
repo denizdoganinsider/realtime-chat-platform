@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"realtime-chat-platform/notification-service/internal/domain"
+	"realtime-chat-platform/notification-service/internal/repository"
 )
 
 type stubSubscriptions struct{ byRoom map[string][]int64 }
@@ -34,13 +35,17 @@ func (s stubWebhooks) ListByUserIDs(ids []int64) ([]domain.Webhook, error) {
 }
 
 type stubDeliveries struct {
-	created []domain.Delivery
-	fail    map[int64]bool
+	created   []domain.Delivery
+	duplicate map[int64]bool
+	dbDown    bool
 }
 
 func (s *stubDeliveries) Create(d *domain.Delivery) error {
-	if s.fail[d.UserID] {
-		return errors.New("duplicate")
+	if s.dbDown {
+		return errors.New("driver: bad connection")
+	}
+	if s.duplicate[d.UserID] {
+		return repository.ErrDuplicate
 	}
 	d.ID = int64(len(s.created) + 1)
 	s.created = append(s.created, *d)
@@ -118,7 +123,7 @@ func TestDuplicateDeliveryRowSkipsRecipient(t *testing.T) {
 	f := NewFanoutService(
 		stubSubscriptions{byRoom: map[string][]int64{"general": {2, 3}}},
 		stubWebhooks{byUser: map[int64]string{2: "u2", 3: "u3"}},
-		&stubDeliveries{fail: map[int64]bool{2: true}},
+		&stubDeliveries{duplicate: map[int64]bool{2: true}},
 		stubPresence{},
 	)
 
@@ -128,6 +133,21 @@ func TestDuplicateDeliveryRowSkipsRecipient(t *testing.T) {
 	}
 	if got := userIDs(recipients); len(got) != 1 || got[0] != 3 {
 		t.Errorf("recipients = %v, want [3]", got)
+	}
+}
+
+// A database outage is not a replay: it must come back as an error, so the
+// fan-out logs it instead of reporting an empty recipient list as success.
+func TestDatabaseErrorIsNotSwallowed(t *testing.T) {
+	f := NewFanoutService(
+		stubSubscriptions{byRoom: map[string][]int64{"general": {2}}},
+		stubWebhooks{byUser: map[int64]string{2: "u2"}},
+		&stubDeliveries{dbDown: true},
+		stubPresence{},
+	)
+
+	if _, err := f.Recipients(context.Background(), msg); err == nil {
+		t.Fatal("Recipients returned nil error while the database was down")
 	}
 }
 

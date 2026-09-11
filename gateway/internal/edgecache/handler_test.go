@@ -3,8 +3,10 @@ package edgecache
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 )
@@ -132,5 +134,97 @@ func TestOriginDownIs502(t *testing.T) {
 	h := NewHandler(New(1<<20, 1<<20), url)
 	if response := get(h, testHash, ""); response.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", response.Code)
+	}
+}
+
+// N concurrent misses for one hash: one origin fetch, everyone gets the body.
+func TestConcurrentMissesCoalesceIntoOneOriginFetch(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(100 * time.Millisecond) // long enough for every client to pile up
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", `"`+testHash+`"`)
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write([]byte("PNGBYTES"))
+	}))
+	defer server.Close()
+
+	h := NewHandler(New(1<<20, 1<<20), server.URL)
+
+	const clients = 50
+	var wg sync.WaitGroup
+	var served atomic.Int32
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if response := get(h, testHash, ""); response.Code == http.StatusOK && response.Body.String() == "PNGBYTES" {
+				served.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if hits.Load() != 1 {
+		t.Errorf("origin was fetched %d times for %d concurrent clients, want 1", hits.Load(), clients)
+	}
+	if served.Load() != clients {
+		t.Errorf("%d of %d clients got the object", served.Load(), clients)
+	}
+}
+
+// An object over the per-object cap is served, uncached, not turned into a
+// permanent 502 because two services' size limits disagree.
+func TestOversizedObjectIsPassedThroughUncached(t *testing.T) {
+	big := make([]byte, 2000)
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", `"`+testHash+`"`)
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write(big)
+	}))
+	defer server.Close()
+
+	cache := New(1<<20, 1000)
+	h := NewHandler(cache, server.URL)
+
+	response := get(h, testHash, "")
+	if response.Code != http.StatusOK || response.Body.Len() != 2000 {
+		t.Fatalf("status=%d len=%d, want 200 with the full body", response.Code, response.Body.Len())
+	}
+	if response.Header().Get(CacheHeader) != "BYPASS" {
+		t.Errorf("X-Cache = %q, want BYPASS", response.Header().Get(CacheHeader))
+	}
+	if response.Header().Get("ETag") != `"`+testHash+`"` {
+		t.Errorf("origin headers not forwarded on passthrough: ETag=%q", response.Header().Get("ETag"))
+	}
+	if cache.Stats().Entries != 0 {
+		t.Error("oversized object was cached")
+	}
+}
+
+// An origin that omits ETag is not cached, and a plain GET never gets a 304.
+func TestOriginWithoutETagIsNotCachedAndPlainGetGetsBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write([]byte("PNGBYTES"))
+	}))
+	defer server.Close()
+
+	cache := New(1<<20, 1<<20)
+	h := NewHandler(cache, server.URL)
+
+	for range 2 {
+		response := get(h, testHash, "")
+		if response.Code != http.StatusOK || response.Body.String() != "PNGBYTES" {
+			t.Fatalf("status=%d body=%q, want 200 with body", response.Code, response.Body.String())
+		}
+	}
+	if cache.Stats().Entries != 0 {
+		t.Error("an ETag-less response was cached")
 	}
 }

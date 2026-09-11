@@ -2,9 +2,19 @@ package repository
 
 import (
 	"database/sql"
+	"errors"
 
 	"realtime-chat-platform/notification-service/internal/domain"
+
+	"github.com/go-sql-driver/mysql"
 )
+
+// ErrDuplicate is the unique (event_id, user_id) key firing: this recipient
+// already has a row for this event. Distinguished from every other error so a
+// replayed event and a database outage are not the same log line.
+var ErrDuplicate = errors.New("delivery already recorded")
+
+const mysqlDuplicateEntry = 1062
 
 type DeliveryRepository struct {
 	db *sql.DB
@@ -19,6 +29,10 @@ func (r *DeliveryRepository) Create(delivery *domain.Delivery) error {
 		`INSERT INTO deliveries (event_id, user_id, room, url, status) VALUES (?, ?, ?, ?, ?)`,
 		delivery.EventID, delivery.UserID, delivery.Room, delivery.URL, domain.DeliveryStatusPending,
 	)
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateEntry {
+		return ErrDuplicate
+	}
 	if err != nil {
 		return err
 	}

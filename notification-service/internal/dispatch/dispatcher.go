@@ -90,14 +90,15 @@ func (d *Dispatcher) Enqueue(event domain.MessageEvent) bool {
 	}
 }
 
-// Close stops accepting work, lets in-flight deliveries finish their current
-// attempt (the backoff sleeps are interruptible, so a delivery mid-retry ends
-// now rather than seconds later), and waits up to timeout.
+// Close stops accepting work and drains: every event already answered with a
+// 202 gets its fan-out (so its delivery rows exist), and queued deliveries are
+// attempted, for up to timeout. Past the timeout the context is cancelled -
+// the backoff sleeps are interruptible, so a delivery mid-retry ends now and
+// is recorded as failed rather than left hanging - and the workers finish
+// their drains fast-failing. Nothing that was accepted disappears without a
+// row or a log line.
 func (d *Dispatcher) Close(timeout time.Duration) {
-	d.stopOnce.Do(func() {
-		close(d.stop)
-		d.cancel()
-	})
+	d.stopOnce.Do(func() { close(d.stop) })
 
 	done := make(chan struct{})
 	go func() {
@@ -107,8 +108,18 @@ func (d *Dispatcher) Close(timeout time.Duration) {
 
 	select {
 	case <-done:
+		return
 	case <-time.After(timeout):
-		slog.Warn("dispatcher shutdown timed out; queued deliveries dropped", "service", "notification-service")
+		slog.Warn("dispatcher drain timed out; cancelling in-flight deliveries", "service", "notification-service")
+		d.cancel()
+	}
+
+	// With the context cancelled every remaining attempt fails at once, so
+	// this second wait is short; it is bounded anyway.
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Error("dispatcher workers did not stop", "service", "notification-service")
 	}
 }
 
@@ -118,9 +129,29 @@ func (d *Dispatcher) runFanout() {
 	for {
 		select {
 		case <-d.stop:
+			d.drainEvents()
 			return
 		case event := <-d.eventQ:
 			d.fanout(event)
+		}
+	}
+}
+
+// Once stop is closed, select picks randomly between the two ready cases, so a
+// plain loop would abandon whatever is still queued. Drain explicitly instead -
+// the same shape as chat-service's dispatcher.
+func (d *Dispatcher) drainEvents() {
+	drained := 0
+	for {
+		select {
+		case event := <-d.eventQ:
+			d.fanout(event)
+			drained++
+		default:
+			if drained > 0 {
+				slog.Info("drained queued message events at shutdown", "service", "notification-service", "count", drained)
+			}
+			return
 		}
 	}
 }
@@ -153,11 +184,27 @@ func (d *Dispatcher) runDelivery() {
 	for {
 		select {
 		case <-d.stop:
+			d.drainDeliveries()
 			return
 		case job := <-d.deliveryQ:
-			ctx, cancel := context.WithTimeout(d.ctx, deliveryTimeout)
-			d.deliverer.Deliver(ctx, job.recipient, job.event)
-			cancel()
+			d.deliver(job)
 		}
 	}
+}
+
+func (d *Dispatcher) drainDeliveries() {
+	for {
+		select {
+		case job := <-d.deliveryQ:
+			d.deliver(job)
+		default:
+			return
+		}
+	}
+}
+
+func (d *Dispatcher) deliver(job deliveryJob) {
+	ctx, cancel := context.WithTimeout(d.ctx, deliveryTimeout)
+	defer cancel()
+	d.deliverer.Deliver(ctx, job.recipient, job.event)
 }

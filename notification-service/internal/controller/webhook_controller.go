@@ -26,7 +26,10 @@ func NewWebhookController(webhookService *service.WebhookService) *WebhookContro
 
 // Put handles PUT /webhook. The response carries the secret; nothing else does.
 func (wc *WebhookController) Put(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	var request PutWebhookRequest
 	if err := c.Bind(&request); err != nil {
@@ -42,7 +45,10 @@ func (wc *WebhookController) Put(c echo.Context) error {
 }
 
 func (wc *WebhookController) Get(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	webhook, err := wc.webhookService.Get(userID)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -56,13 +62,28 @@ func (wc *WebhookController) Get(c echo.Context) error {
 }
 
 func (wc *WebhookController) Delete(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	if err := wc.webhookService.Delete(userID); err != nil {
 		return respondError(c, err, "failed to delete webhook")
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+// userIDFrom reads the identity GatewayAuthMiddleware established. The comma-ok
+// form is deliberate: a handler wired outside the gateway-auth group answers
+// 401, not a panic (this service registers no Recover middleware).
+func userIDFrom(c echo.Context) (int64, bool) {
+	userID, ok := c.Get(middleware.UserIDKey).(int64)
+	return userID, ok && userID > 0
+}
+
+func unauthorized(c echo.Context) error {
+	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 }
 
 // A validation error is the caller's fault and its message is safe to echo

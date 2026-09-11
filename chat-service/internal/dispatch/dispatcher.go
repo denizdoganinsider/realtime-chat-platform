@@ -36,6 +36,14 @@ const (
 
 	presenceEventTimeout = 30 * time.Second
 	notifyEventTimeout   = 30 * time.Second
+	// During shutdown one event must not hold the drain for its full retry
+	// budget; enough for one attempt and a short retry, no more.
+	notifyDrainTimeout = 3 * time.Second
+
+	// A pool, unlike the presence worker: message events carry their own id
+	// and timestamp, so their order does not matter, and a notification-service
+	// brownout must not let one event's retry budget stall every other event.
+	notifyWorkers = 4
 )
 
 type presenceEvent struct {
@@ -80,10 +88,12 @@ func NewDispatcher(presenceClient PresenceSender, messageService MessageCreator,
 		stop:               make(chan struct{}),
 	}
 
-	d.wg.Add(3)
+	d.wg.Add(2 + notifyWorkers)
 	go d.runPresenceWorker()
 	go d.runArchiveWorker()
-	go d.runNotifyWorker()
+	for range notifyWorkers {
+		go d.runNotifyWorker()
+	}
 
 	return d
 }
@@ -244,8 +254,6 @@ func (d *Dispatcher) handleArchive(event archiveEvent) {
 	}
 }
 
-// Independent of the archive worker, and free to become a pool: message events
-// carry their own timestamp and id, so order between them does not matter.
 func (d *Dispatcher) runNotifyWorker() {
 	defer d.wg.Done()
 
@@ -255,7 +263,7 @@ func (d *Dispatcher) runNotifyWorker() {
 			d.drainNotify()
 			return
 		case event := <-d.notifyQ:
-			d.handleNotify(event)
+			d.handleNotify(event, notifyEventTimeout)
 		}
 	}
 }
@@ -264,15 +272,15 @@ func (d *Dispatcher) drainNotify() {
 	for {
 		select {
 		case event := <-d.notifyQ:
-			d.handleNotify(event)
+			d.handleNotify(event, notifyDrainTimeout)
 		default:
 			return
 		}
 	}
 }
 
-func (d *Dispatcher) handleNotify(event archiveEvent) {
-	ctx, cancel := context.WithTimeout(context.Background(), notifyEventTimeout)
+func (d *Dispatcher) handleNotify(event archiveEvent, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	err := d.notificationClient.SendMessageEvent(ctx, domain.MessageEvent{

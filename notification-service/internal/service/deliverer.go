@@ -36,11 +36,13 @@ type Deliverer struct {
 	sleep        func(ctx context.Context, attempt int) error
 }
 
-func NewDeliverer(deliveryRepo repository.DeliveryRepositoryInterface) *Deliverer {
+func NewDeliverer(deliveryRepo repository.DeliveryRepositoryInterface, allowLoopback bool) *Deliverer {
 	return &Deliverer{
 		deliveryRepo: deliveryRepo,
 		httpClient: &http.Client{
 			Timeout: deliveryRequestTimeout,
+			// Resolves and filters every destination at dial time; see ssrf.go.
+			Transport: newSafeTransport(allowLoopback),
 			// A receiver that answers with a redirect to somewhere else is not
 			// the endpoint the user registered. Deliver to the URL as given.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

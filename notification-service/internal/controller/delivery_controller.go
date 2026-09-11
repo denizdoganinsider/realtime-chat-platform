@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"realtime-chat-platform/notification-service/internal/middleware"
 	"realtime-chat-platform/notification-service/internal/repository"
 
 	"github.com/labstack/echo/v4"
@@ -27,7 +26,10 @@ func NewDeliveryController(deliveryRepo repository.DeliveryRepositoryInterface) 
 // first. It reads the repository directly: there is no business rule between
 // the row and the caller.
 func (dc *DeliveryController) List(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	limit := defaultDeliveryLimit
 	if raw := c.QueryParam("limit"); raw != "" {

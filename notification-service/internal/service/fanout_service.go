@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -105,12 +106,18 @@ func (s *FanoutService) Recipients(ctx context.Context, event domain.MessageEven
 			URL:     webhook.URL,
 			Status:  domain.DeliveryStatusPending,
 		}
-		if err := s.deliveryRepo.Create(&delivery); err != nil {
-			// The unique (event_id, user_id) key makes a replayed event a no-op
-			// here rather than a second webhook call.
-			slog.Warn("skipping delivery: could not record it",
-				"service", "notification-service", "event_id", event.EventID, "user_id", webhook.UserID, "error", err)
+		err := s.deliveryRepo.Create(&delivery)
+		if errors.Is(err, repository.ErrDuplicate) {
+			// A replayed event: this recipient already has a row, and so
+			// already had (or is having) its webhook call. Skip, not resend.
+			slog.Info("skipping delivery: already recorded",
+				"service", "notification-service", "event_id", event.EventID, "user_id", webhook.UserID)
 			continue
+		}
+		if err != nil {
+			// Anything else is the database failing, which must surface as a
+			// fan-out error - not vanish as if every recipient were a replay.
+			return nil, fmt.Errorf("recording delivery for user %d: %w", webhook.UserID, err)
 		}
 		recipients = append(recipients, Recipient{Webhook: webhook, Delivery: delivery})
 	}

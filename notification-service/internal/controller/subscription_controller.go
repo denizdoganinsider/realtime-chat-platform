@@ -3,7 +3,6 @@ package controller
 import (
 	"net/http"
 
-	"realtime-chat-platform/notification-service/internal/middleware"
 	"realtime-chat-platform/notification-service/internal/service"
 
 	"github.com/labstack/echo/v4"
@@ -22,7 +21,10 @@ func NewSubscriptionController(subscriptionService *service.SubscriptionService)
 }
 
 func (sc *SubscriptionController) Subscribe(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	var request SubscribeRequest
 	if err := c.Bind(&request); err != nil {
@@ -37,7 +39,10 @@ func (sc *SubscriptionController) Subscribe(c echo.Context) error {
 }
 
 func (sc *SubscriptionController) Unsubscribe(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	if err := sc.subscriptionService.Unsubscribe(userID, c.Param("room")); err != nil {
 		return respondError(c, err, "failed to unsubscribe")
@@ -47,7 +52,10 @@ func (sc *SubscriptionController) Unsubscribe(c echo.Context) error {
 }
 
 func (sc *SubscriptionController) List(c echo.Context) error {
-	userID := c.Get(middleware.UserIDKey).(int64)
+	userID, ok := userIDFrom(c)
+	if !ok {
+		return unauthorized(c)
+	}
 
 	subscriptions, err := sc.subscriptionService.List(userID)
 	if err != nil {

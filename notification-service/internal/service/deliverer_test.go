@@ -44,7 +44,7 @@ func (r *recordingDeliveries) final() (domain.DeliveryStatus, int) {
 }
 
 func newTestDeliverer(repo *recordingDeliveries) *Deliverer {
-	d := NewDeliverer(repo)
+	d := NewDeliverer(repo, true) // httptest servers live on loopback
 	d.now = func() time.Time { return time.Unix(1700000000, 0) }
 	d.sleep = func(context.Context, int) error { return nil } // no real backoff in tests
 	return d
@@ -189,7 +189,7 @@ func TestCancelledContextStopsRetrying(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	repo := &recordingDeliveries{}
-	d := NewDeliverer(repo)
+	d := NewDeliverer(repo, true)
 	d.sleep = func(ctx context.Context, attempt int) error {
 		cancel()
 		return ctx.Err()

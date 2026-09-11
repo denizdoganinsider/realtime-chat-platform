@@ -46,7 +46,7 @@ func main() {
 	subscriptionService := service.NewSubscriptionService(subscriptionRepo)
 	presenceClient := service.NewPresenceClient(cfg.PresenceServiceURL, cfg.PresenceAPIKey)
 	fanout := service.NewFanoutService(subscriptionRepo, webhookRepo, deliveryRepo, presenceClient)
-	deliverer := service.NewDeliverer(deliveryRepo)
+	deliverer := service.NewDeliverer(deliveryRepo, allowLoopback)
 
 	dispatcher := dispatch.NewDispatcher(fanout, deliverer, cfg.DeliveryWorkers)
 	defer dispatcher.Close(10 * time.Second)

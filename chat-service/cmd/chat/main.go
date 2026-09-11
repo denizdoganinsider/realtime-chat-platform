@@ -43,8 +43,10 @@ func main() {
 	// Deferred calls run last-in-first-out, so this reads bottom-up at exit: the
 	// hub stops first, then the heartbeat, then the dispatcher drains whatever
 	// the rooms queued on their way out.
+	// The budget covers the archive drain plus the notify drain, which makes
+	// one bounded HTTP call per queued event (see notifyDrainTimeout).
 	dispatcher := dispatch.NewDispatcher(presenceClient, messageService, notificationClient)
-	defer dispatcher.Close(5 * time.Second)
+	defer dispatcher.Close(15 * time.Second)
 
 	hub := ws.NewHub(dispatcher, dispatcher)
 	defer hub.Close()

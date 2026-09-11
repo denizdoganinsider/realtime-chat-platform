@@ -56,12 +56,14 @@ func validateWebhookURL(raw string, allowLoopback bool) error {
 		return fmt.Errorf("%w: url must not carry credentials", ErrValidation)
 	}
 
+	// The string-level check. It catches literals and the obvious names, and
+	// is a courtesy to the caller (a 400 now rather than a failed delivery
+	// later). The check that actually holds is in the transport - see
+	// newSafeTransport - because what a hostname resolves to is not a
+	// property of the string.
 	host := parsed.Hostname()
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() && allowLoopback {
-			return nil
-		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if forbiddenIP(ip, allowLoopback) {
 			return fmt.Errorf("%w: url must not point at a private or local address", ErrValidation)
 		}
 		return nil
