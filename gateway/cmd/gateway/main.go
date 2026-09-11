@@ -12,6 +12,7 @@ import (
 
 	"realtime-chat-platform/gateway/config"
 	"realtime-chat-platform/gateway/internal/controller"
+	"realtime-chat-platform/gateway/internal/loadbalancer"
 	"realtime-chat-platform/gateway/internal/proxy"
 	"realtime-chat-platform/gateway/internal/repository"
 	"realtime-chat-platform/gateway/internal/service"
@@ -40,11 +41,21 @@ func main() {
 	defer ticketService.Close()
 	ticketController := controller.NewTicketController(ticketService)
 
-	chatProxy, err := proxy.NewServiceProxy(cfg.ChatServiceURL)
+	// Every chat-service instance the gateway may route to. The pool is the
+	// load balancer's view of the world: fixed membership, live health.
+	chatPool, err := loadbalancer.NewPool(cfg.ChatServiceURLs)
 	if err != nil {
-		slog.Error("failed to build chat-service proxy", "error", err)
+		slog.Error("failed to build chat-service pool", "error", err)
 		os.Exit(1)
 	}
+	chatPool.Start(time.Duration(cfg.LBHealthIntervalSecs) * time.Second)
+	defer chatPool.Close()
+
+	// Two strategies for two kinds of request. History is a database read any
+	// instance can serve, so it round-robins. /ws must be sticky per room -
+	// the Hub is per-process - so it hashes on the room name.
+	chatHistoryProxy := proxy.NewBalancedProxy(chatPool, loadbalancer.NewRoundRobin(chatPool))
+	chatWSProxy := proxy.NewBalancedProxy(chatPool, loadbalancer.NewConsistentHash(chatPool, loadbalancer.RoomKey))
 
 	presenceProxy, err := proxy.NewServiceProxy(cfg.PresenceServiceURL)
 	if err != nil {
@@ -57,6 +68,8 @@ func main() {
 	e.Use(gatewayMiddleware.RequestIDMiddleware)
 	e.Use(gatewayMiddleware.LoggerMiddleware)
 
+	// Liveness only. The gateway is the one public entry point, so this must
+	// not list internal instances - see /health/backends below.
 	e.GET("/health", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -69,23 +82,45 @@ func main() {
 	auth.GET("/me", authController.Me)
 	auth.POST("/ws-ticket", ticketController.Issue)
 
-	// Reverse-proxied to chat-service. /rooms requires the same Bearer
-	// token as /me (chat-service re-validates it independently).
-	auth.GET("/rooms", chatProxy)
-	// Echo matches routes exactly, so /rooms does not cover /rooms/:room/messages.
-	auth.GET("/rooms/:room/messages", chatProxy)
+	// What the load balancer knows about the pool, so "which instance does the
+	// gateway think is down" is one curl away. Behind the Bearer token, not on
+	// the public /health: internal host:port pairs and which of them are
+	// degraded is topology, and an anonymous caller has no business with it.
+	auth.GET("/health/backends", func(c echo.Context) error {
+		backends := make([]map[string]any, 0, len(chatPool.Backends()))
+		for _, b := range chatPool.Backends() {
+			backends = append(backends, map[string]any{"backend": b.String(), "healthy": b.Healthy()})
+		}
+		return c.JSON(http.StatusOK, map[string]any{"chat_service": backends})
+	})
+
+	// Message history is a database read, so any chat-service instance can
+	// answer it: round-robin. The Bearer token is forwarded as-is and
+	// chat-service re-validates it independently.
+	auth.GET("/rooms/:room/messages", chatHistoryProxy)
 
 	// /ws is not in the auth group: a browser cannot put a Bearer token on a
 	// WebSocket handshake. It presents a one-shot ticket instead, which this
 	// middleware exchanges for an Authorization header on the proxied request -
 	// something the gateway can set even though the browser cannot.
-	e.GET("/ws", chatProxy, gatewayMiddleware.WSTicketMiddleware(ticketService))
+	//
+	// Routed by consistent hash on ?room=, so every connection to a room lands
+	// on the one instance whose in-memory Hub holds it.
+	e.GET("/ws", chatWSProxy, gatewayMiddleware.WSTicketMiddleware(ticketService))
 
 	// The gateway is the only public entry point, so presence-service's
-	// end-user read path is reachable through it and nowhere else. No path
+	// end-user read paths are reachable through it and nowhere else. No path
 	// rewriting is needed: the target URL carries no path, so /presence/general
 	// is joined unchanged, and the caller's Authorization header is forwarded
 	// as-is for presence-service to validate independently.
+	//
+	// /rooms moved here from chat-service in month 3. With N instances, each
+	// chat-service only knows the rooms its own Hub holds, so a round-robined
+	// /rooms would answer differently on every call. presence-service sees all
+	// of them through Redis, which makes it the source of truth for room
+	// metadata. chat-service still serves its own /rooms directly on its port -
+	// that per-instance view is how the verification proves stickiness.
+	auth.GET("/rooms", presenceProxy)
 	auth.GET("/presence/:room", presenceProxy)
 
 	go func() {

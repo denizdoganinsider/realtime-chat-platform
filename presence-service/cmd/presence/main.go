@@ -58,6 +58,7 @@ func main() {
 	auth := e.Group("")
 	auth.Use(presenceMiddleware.JWTMiddleware)
 	auth.GET("/presence/:room", presenceController.GetRoom)
+	auth.GET("/rooms", presenceController.ListRooms)
 
 	go func() {
 		if err := e.Start(fmt.Sprintf(":%s", cfg.ServerPort)); err != nil && err != http.ErrServerClosed {
