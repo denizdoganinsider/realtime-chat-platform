@@ -11,51 +11,58 @@ Remaining concepts from the source material and the month they're addressed:
 | Microservice       | 1 |
 | Reverse Proxy       | 1 |
 | WebSocket           | 1 |
-| Load Balancer       | 3 (planned) |
+| Load Balancer       | 3 |
 | CDN                 | 4 (planned) |
 
-## Architecture (Months 1-2)
+## Architecture (Months 1-3)
 
 Three independently deployable Go services, tied together for local development
-via a Go workspace (`go.work`):
+via a Go workspace (`go.work`). From month 3 chat-service runs as **N
+instances** behind the gateway:
 
 ```
-                    ┌─────────────┐        ┌──────────────┐
-  client  ─────────▶│   gateway    │──────▶│ chat-service  │──────┐
- (HTTP/WS)           │  :8000       │ proxy  │  :8001        │      │
-                    │              │        │               │      │ presence
-                    │ - register    │        │ - /ws (hub)   │      │  events
-                    │ - login       │        │ - /rooms      │      │ (HTTP)
-                    │ - ws-ticket   │        │ - history     │      │
-                    │ - reverse     │        └──────┬───────┘      ▼
-                    │   proxy       │                │       ┌──────────────────┐
-                    └──────┬───────┘                 │        │ presence-service  │
-                           │                        │        │  :8002            │
-                    ┌──────▼──────────────┐         │        └────────┬─────────┘
-                    │       MySQL          │◀───────┘                 │
-                    │ chat_gateway_db      │                   ┌──────▼──────┐
-                    │  (users)             │                   │    Redis     │
-                    │ chat_service_db      │                   │ (presence)   │
-                    │  (messages)          │                   └─────────────┘
-                    └─────────────────────┘
+                    ┌─────────────┐          ┌──────────────┐
+  client  ─────────▶│   gateway    │ ───┬───▶│ chat-service  │──────┐
+ (HTTP/WS)           │  :8000       │    │    │  :8001        │      │
+                    │              │    │    └──────┬───────┘      │
+                    │ - register    │    │           │              │ presence
+                    │ - login       │    │    ┌──────┼───────┐      │  events +
+                    │ - ws-ticket   │    └───▶│ chat-service  │─────┤  heartbeats
+                    │ - reverse     │  load   │  :8011        │      │ (HTTP)
+                    │   proxy       │ balancer└──────┼───────┘      ▼
+                    │ - load        │                │       ┌──────────────────┐
+                    │   balancer    │                │        │ presence-service  │
+                    └──────┬───────┘                 │        │  :8002            │
+                           │                        │        │ - /presence/:room │
+                    ┌──────▼──────────────┐         │        │ - /rooms          │
+                    │       MySQL          │◀───────┘        └────────┬─────────┘
+                    │ chat_gateway_db      │                          │
+                    │  (users)             │                   ┌──────▼──────┐
+                    │ chat_service_db      │                   │    Redis     │
+                    │  (messages)          │                   │ (presence)   │
+                    └─────────────────────┘                   └─────────────┘
 ```
 
 - **gateway** is the only public entry point. It owns authentication
   (`/register`, `/login`, JWT issuance), issues single-use WebSocket tickets,
-  and acts as a **reverse proxy** in front of chat-service (`/rooms`,
-  `/rooms/:room/messages`, `/ws`) and presence-service (`/presence/:room`).
-  Go's stdlib `httputil.ReverseProxy` handles the WebSocket upgrade
-  transparently — no bespoke proxy code was needed for that part, which is
-  itself the lesson (see `gateway/internal/proxy/reverse_proxy.go`).
+  and acts as a **reverse proxy** in front of chat-service
+  (`/rooms/:room/messages`, `/ws`) and presence-service (`/rooms`,
+  `/presence/:room`). Go's stdlib `httputil.ReverseProxy` handles the
+  WebSocket upgrade transparently — no bespoke proxy code was needed for that
+  part, which is itself the lesson (see `gateway/internal/proxy/`). Since
+  month 3 it is also the **load balancer** across chat-service instances
+  (`gateway/internal/loadbalancer/`).
 - **chat-service** owns real-time messaging: a hub/room/client pattern over
   `gorilla/websocket`, plus message persistence and paginated history. It does
   not issue tokens — it independently validates JWTs against a `JWT_SECRET`
   shared with the gateway via environment variable. This is the standard
   microservice pattern: share a **secret/config value**, not a code library,
-  across independently deployable services.
+  across independently deployable services. The Hub is in-memory and
+  per-process, which is the whole reason month 3 exists.
 - **presence-service** owns who is online, in Redis, with a TTL. chat-service
-  tells it about joins and leaves over HTTP; it never reaches into chat-service,
-  and chat-service never reaches into its Redis.
+  instances tell it about joins and leaves over HTTP; it never reaches into
+  chat-service, and chat-service never reaches into its Redis. Because it is
+  the one component that sees every instance, it also answers `/rooms`.
 - **Database per service.** The gateway owns `chat_gateway_db` (users);
   chat-service owns `chat_service_db` (messages). Same container, separate
   schemas, and `messages.user_id` has **no foreign key** to `users` — MySQL
@@ -84,8 +91,8 @@ request it makes**.
 
 So the long-lived token never appears in a URL, and the thing that does is worth
 one connection for thirty seconds. The ticket store is an in-memory map with a
-reaper goroutine: the gateway is a single process, and stays one in month 3
-where it becomes the load balancer rather than sitting behind one. If it is ever
+reaper goroutine: the gateway is a single process, and stays one in month 3,
+where it *is* the load balancer rather than sitting behind one. If it is ever
 replicated, that map is what moves to Redis.
 
 The gateway's `LoggerMiddleware` still logs the request **path only**, and
@@ -101,12 +108,16 @@ docker-compose up -d
 cd presence-service && JWT_SECRET=my-secret-key PRESENCE_API_KEY=dev-presence-key \
   go run ./cmd/presence                                              # :8002
 
-# 3. chat-service
+# 3. chat-service - two instances (month 3); one is enough for months 1-2
 cd chat-service && JWT_SECRET=my-secret-key PRESENCE_API_KEY=dev-presence-key \
-  go run ./cmd/chat                                                  # :8001
+  SERVER_PORT=8001 go run ./cmd/chat                                 # :8001
+cd chat-service && JWT_SECRET=my-secret-key PRESENCE_API_KEY=dev-presence-key \
+  SERVER_PORT=8011 go run ./cmd/chat                                 # :8011
 
-# 4. gateway
-cd gateway && JWT_SECRET=my-secret-key go run ./cmd/gateway          # :8000
+# 4. gateway, told about both
+cd gateway && JWT_SECRET=my-secret-key \
+  CHAT_SERVICE_URLS=http://localhost:8001,http://localhost:8011 \
+  go run ./cmd/gateway                                               # :8000
 ```
 
 `JWT_SECRET` and `PRESENCE_API_KEY` have **no defaults** — every service that
@@ -119,8 +130,11 @@ must match across all three (shared secret, not shared code — see Architecture
 
 | Service | Variable | Default |
 |---|---|---|
-| gateway | `CHAT_SERVICE_URL` | `http://localhost:8001` |
+| gateway | `CHAT_SERVICE_URLS` | `http://localhost:8001` (comma-separated) |
+| gateway | `LB_HEALTH_INTERVAL_SECONDS` | `5` |
 | gateway | `PRESENCE_SERVICE_URL` | `http://localhost:8002` |
+| chat-service | `SERVER_PORT` | `8001` |
+| chat-service | `INSTANCE_ID` | `chat-<SERVER_PORT>` |
 | chat-service | `DB_NAME` | `chat_service_db` |
 | chat-service | `PRESENCE_SERVICE_URL` | `http://localhost:8002` |
 | chat-service | `PRESENCE_API_KEY` | *required* |
@@ -164,12 +178,14 @@ TOKEN=$(curl -s -X POST localhost:8000/login -H "$JSON" \
 
 # one ticket per connection - it is single-use
 TICKET=$(curl -s -X POST localhost:8000/ws-ticket -H "Authorization: Bearer $TOKEN" | jq -r .ticket)
-websocat "ws://localhost:8000/ws?room=general&ticket=$TICKET"
+websocat -v "ws://localhost:8000/ws?room=general&ticket=$TICKET"
 ```
 
 Open two sessions in the same room with their own tickets and confirm messages
 sent from one appear in the other — proof that proxy + microservice + WebSocket
-are working together end to end.
+are working together end to end. With two chat-service instances running, that
+is also proof the load balancer kept both sessions on the same one: `-v` shows
+the handshake headers, and `X-Chat-Instance` names the instance that answered.
 
 ```bash
 go test ./gateway/... ./chat-service/... ./presence-service/... -race
@@ -200,7 +216,8 @@ Two deliberate departures from the predecessor:
 
 ### Presence
 
-Redis holds one sorted set per room:
+Redis holds one sorted set per room (month 3 widened the member to
+`<user_id>:<instance_id>` — see there):
 
 ```
 presence:room:<room>   member = "<user_id>"   score = expiry epoch millis
@@ -307,42 +324,154 @@ Self-healing, and proof the room never stalls:
 # client having reconnected
 ```
 
+## Month 3 — Load Balancer
+
+Two chat-service instances (`:8001`, `:8011`) behind the gateway. This is
+where the WebSocket **sticky-session problem** stops being a comment in
+`hub.go` and becomes a bug you can watch happen: the `Hub` is in-memory and
+per-process, so two clients in the same room MUST land on the same instance or
+they never see each other's messages.
+
+### Two strategies, because there are two kinds of request
+
+`gateway/internal/loadbalancer/` has a `Strategy` interface with one method,
+`Pick(request) (backend, error)`, and two implementations. Which one a route
+uses is decided in `main.go`, per route, because the routes are not the same
+problem:
+
+| Route | Strategy | Why |
+|---|---|---|
+| `GET /rooms/:room/messages` | **round-robin** | A database read. Any instance can answer, so spread the load. |
+| `GET /ws` | **consistent hash on `?room=`** | The room lives in one instance's memory. Every connection to it must go there. |
+
+Round-robin counts over the *healthy* list, not the full one: skipping a dead
+instance by re-picking would hand the instance after it double the traffic.
+
+Consistent hashing is a ring of 150 virtual points per instance, keyed by
+FNV-1a with a finalizer mix. Both details matter. With one point per instance,
+two instances could split the ring 90/10. And the virtual node labels differ
+only in a numeric suffix (`a:1#0`, `a:1#1`, ...) — raw FNV-1a of near-identical
+inputs gives near-identical high bits, and the first version of this ring
+measured a **70/20/10** split across three instances before the MurmurHash3
+finalizer was added. `TestConsistentHashSpreadsRoomsEvenly` is the regression
+test for that. The other property the ring buys over `hash % N` is that adding
+a fourth instance moves about a quarter of the rooms rather than three
+quarters; `TestConsistentHashMovesFewKeysWhenScalingOut` pins it.
+
+`?room=` omitted hashes as `general`, exactly as chat-service defaults it,
+so the two ways of naming the default room cannot split across instances.
+
+### Health checks, and why a dead instance's rooms fail closed
+
+The gateway polls every instance's `/health` every `LB_HEALTH_INTERVAL_SECONDS`
+(one synchronous sweep at startup, so the very first request already sees the
+truth). Its own `/health` reports what it knows:
+
+```json
+{"status":"ok","chat_service":[{"backend":"localhost:8001","healthy":true},
+                               {"backend":"localhost:8011","healthy":false}]}
+```
+
+Round-robin routes around a dead instance. Consistent hash **does not**. The
+ring is built over all configured instances and never rebuilt, so a room whose
+instance is down answers `503` until the instance returns. That is the
+trade-off named up front in the roadmap, and it is the right one: if the ring
+shrank when an instance died, its rooms would move to a neighbour, and when it
+came back they would move again — clients that connected in between would be
+split across two instances of the same room, the exact bug the strategy exists
+to prevent. Failing closed keeps the guarantee; the cost is that those rooms
+are unavailable for the outage. The "real" fix — a Redis pub/sub backplane so
+any instance can serve any room — is a different lesson (distributed
+broadcast, not load balancing) and is deliberately not built.
+
+### What moved: `/rooms` is now presence-service's
+
+With N instances, each chat-service only knows the rooms its own Hub holds, so
+a round-robined `/rooms` would answer differently on every call. Redis is the
+one place that sees every instance, so `GET /rooms` is now served by
+presence-service and proxied by the gateway. chat-service keeps its own
+`/rooms`, reachable on its port directly and not through the gateway — that
+per-instance view is how the verification below proves stickiness.
+
+To make it cheap, presence writes maintain a `presence:rooms` index ZSET as a
+by-product (same expiry-score scheme as the rooms themselves), rather than the
+read path doing a `SCAN` over the keyspace. The last `offline` out of a room
+drops it from the index; a `kill -9`'d instance's rooms fall out by score.
+
+### The presence flaw month 2 named, fixed
+
+The month 2 roadmap called it out: with N instances, an `offline` from
+instance A would clobber an `online` from instance B for the same user. The
+member is now `<user_id>:<instance_id>`:
+
+```
+presence:room:<room>   member = "<user_id>:<instance_id>"   score = expiry epoch millis
+presence:rooms         member = "<room>"                    score = expiry epoch millis
+```
+
+A's `ZREM` touches only A's entry, each instance's heartbeat re-stamps only
+its own members, and the read path collapses the instances back to one user
+id. `INSTANCE_ID` defaults to `chat-<port>` (two instances on one machine
+differ only by port); a real deployment sets a hostname. presence-service
+validates it — no colons, since it sits after one in the member — and the
+event and heartbeat bodies both carry it. This is the second wire-contract
+change between the two services, and, as with the first, they change together
+and share no code.
+
+### Verification
+
+Which instance answered is visible three ways, all deliberately: the
+`X-Chat-Instance` response header (on the WebSocket 101 too — gorilla writes
+that response itself, so the header is passed to `Upgrade` rather than set on
+the `ResponseWriter`), the gateway's `proxying request` log line, and
+chat-service's one `websocket connected` line per connection. The last two
+share a `request_id`.
+
+```bash
+# the same room lands on the same instance every time; different rooms spread
+for room in general random alpha beta; do
+  printf '%-8s' $room
+  for i in 1 2 3; do
+    T=$(curl -s -X POST localhost:8000/ws-ticket -H "Authorization: Bearer $TOKEN" | jq -r .ticket)
+    websocat -v "ws://localhost:8000/ws?room=$room&ticket=$T" 2>&1 </dev/null | grep -o 'X-Chat-Instance: [^ ]*' | tr '\n' ' '
+  done; echo
+done
+# => general  chat-8001 chat-8001 chat-8001
+#    random   chat-8011 chat-8011 chat-8011
+
+# history round-robins regardless of room
+for i in 1 2 3 4; do
+  curl -si "localhost:8000/rooms/general/messages?per_page=1" \
+    -H "Authorization: Bearer $TOKEN" | grep X-Chat-Instance
+done
+# => chat-8001 chat-8011 chat-8001 chat-8011
+
+# the fleet-wide view versus each instance's own (connect a client to general
+# and one to random first)
+curl -s localhost:8000/rooms -H "Authorization: Bearer $TOKEN"   # both rooms
+curl -s localhost:8001/rooms -H "Authorization: Bearer $TOKEN"   # only general
+curl -s localhost:8011/rooms -H "Authorization: Bearer $TOKEN"   # only random
+
+# the same request_id on both sides of the proxy
+grep '"path":"/ws"' gateway.log | jq -c '{backend,request_id}'
+grep 'websocket connected' chat8001.log | jq -c '{instance,room,request_id}'
+```
+
+Kill one instance mid-session:
+
+```bash
+kill -9 $(lsof -ti :8011)
+sleep $LB_HEALTH_INTERVAL_SECONDS
+curl -s localhost:8000/health | jq -c .chat_service     # 8011 healthy:false
+# a room hashed to 8011 => 503 "the instance serving this room is unavailable"
+# a room hashed to 8001 => connects as before
+# history => 200 every time, all from chat-8001
+```
+
+Start it again and its rooms are reachable within one health interval, on the
+same instance they were on before — nothing moved.
+
 ## Roadmap (not yet implemented)
-
-### Month 3 — Load Balancer
-
-Run **multiple chat-service instances** (`:8001`, `:8011`, ...) behind the
-gateway. This is where the WebSocket **sticky-session problem** becomes
-unavoidable: `chat-service`'s `Hub` is in-memory and per-process (see month
-1's `hub.go` comment), so two clients in the same room MUST land on the
-same instance or they can't see each other's messages.
-
-- `gateway/internal/loadbalancer/`: a small pluggable LB with two
-  strategies —
-  - **round-robin** for stateless requests (`/register`, `/login`, `/rooms`
-    listing — any instance can answer since presence-service, not
-    chat-service, is the source of truth for room metadata by month 3).
-  - **consistent hashing on the `room` query param** for `/ws` — the same
-    room name always resolves to the same chat-service instance, which
-    solves the sticky-session problem *without* needing shared state
-    between instances (the trade-off explained explicitly: this is the
-    "cheap" fix; the "real" fix — a Redis pub/sub backplane so any
-    instance can serve any room — is called out as a stretch goal, not
-    built, to keep the lesson about load balancing rather than distributed
-    broadcast).
-- Basic **health checking**: gateway polls each instance's `/health` on an
-  interval and routes around a dead one; if the room's hashed instance is
-  down, that room's connections fail closed (documented, not silently
-  rerouted — rerouting would silently break the sticky guarantee).
-- Presence is already multi-instance-safe: every instance sends idempotent
-  `ZADD`s and Redis merges them. One real flaw to fix when that day comes — with
-  N instances, an `offline` from instance A can clobber an `online` from
-  instance B for the same user. The fix is a `<userID>:<instanceID>` ZSET
-  member; it is deliberately not built yet.
-- **Verification**: start 2 chat-service instances, confirm two clients in
-  the same room always hit the same instance (log the `request_id` +
-  instance port on both proxy and backend to prove it); kill one instance
-  mid-session and confirm only the rooms hashed to it are affected.
 
 ### Month 4 — Notification Service + CDN
 
@@ -369,7 +498,7 @@ same instance or they can't see each other's messages.
 
 Each month's plan will be fleshed out into its own implementation plan
 (scope, files, verification) right before that month starts, the same way
-months 1 and 2 were — this section is the standing outline, not the final word.
+months 1 to 3 were — this section is the standing outline, not the final word.
 
 ## Known trade-offs
 
@@ -382,8 +511,19 @@ months 1 and 2 were — this section is the standing outline, not the final word
 - **Presence is eventually consistent by design.** Events can be dropped when a
   queue is full; the heartbeat is the source of truth. Exact presence would need
   a different design, and a chat sidebar does not need one.
-- **Same user, two sockets in one room** briefly shows offline when one closes,
-  until the next heartbeat. Refcounting in Redis is the proper fix; the sweep
-  covers it for now.
+- **Same user, two sockets in one room *on the same instance*** briefly shows
+  offline when one closes, until the next heartbeat. Month 3 fixed the
+  cross-instance version of this (per-instance members); within one instance,
+  refcounting in Redis is the proper fix and the sweep covers it for now.
+- **A dead instance takes its rooms with it** until it is back. Failing closed
+  is the honest cost of sticky routing without a backplane (see month 3).
+- **Instance membership is static.** `CHAT_SERVICE_URLS` is read at startup;
+  adding an instance means restarting the gateway. Service discovery is a
+  different lesson.
+- **Health is polled, not observed.** A request that hits an instance in the
+  seconds between its death and the next poll gets a `502`. Marking an
+  instance down on a proxy error would close that gap, but a client hanging up
+  mid-WebSocket also surfaces as a proxy error, and telling the two apart
+  reliably was not worth the risk of flapping a healthy instance.
 - **No rate limiting on typing frames.** notification-api's Redis rate limiter
   is the obvious port, but it would re-learn month-1 material.

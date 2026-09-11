@@ -16,6 +16,7 @@ type Config struct {
 
 	JWTSecret  string
 	ServerPort string
+	InstanceID string
 
 	PresenceServiceURL    string
 	PresenceAPIKey        string
@@ -25,6 +26,8 @@ type Config struct {
 }
 
 func LoadConfig() *Config {
+	serverPort := getEnv("SERVER_PORT", "8001")
+
 	return &Config{
 		DBHost:     getEnv("DB_HOST", "localhost"),
 		DBPort:     getEnv("DB_PORT", "3307"),
@@ -35,7 +38,12 @@ func LoadConfig() *Config {
 		DBName: getEnv("DB_NAME", "chat_service_db"),
 
 		JWTSecret:  requireEnv("JWT_SECRET"),
-		ServerPort: getEnv("SERVER_PORT", "8001"),
+		ServerPort: serverPort,
+		// Names this process to presence-service and in its own logs. Two
+		// instances on one machine differ only by port, so the port is the
+		// default; a real deployment sets something like the pod name. Must
+		// match ^[A-Za-z0-9_.-]{1,64}$ - it becomes part of a Redis member.
+		InstanceID: getEnv("INSTANCE_ID", "chat-"+serverPort),
 
 		PresenceServiceURL:    getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
 		PresenceAPIKey:        requireEnv("PRESENCE_API_KEY"),

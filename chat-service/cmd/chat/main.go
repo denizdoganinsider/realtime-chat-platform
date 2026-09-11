@@ -37,7 +37,7 @@ func main() {
 	messageService := service.NewMessageService(messageRepo)
 	messageController := controller.NewMessageController(messageService)
 
-	presenceClient := service.NewPresenceClient(cfg.PresenceServiceURL, cfg.PresenceAPIKey)
+	presenceClient := service.NewPresenceClient(cfg.PresenceServiceURL, cfg.PresenceAPIKey, cfg.InstanceID)
 
 	// Deferred calls run last-in-first-out, so this reads bottom-up at exit: the
 	// hub stops first, then the heartbeat, then the dispatcher drains whatever
@@ -52,19 +52,24 @@ func main() {
 		time.Duration(cfg.PresenceHeartbeatSecs)*time.Second)
 	defer heartbeat.Close()
 
-	handler := ws.NewHandler(hub, cfg.WSAllowedOrigins)
+	handler := ws.NewHandler(hub, cfg.WSAllowedOrigins, cfg.InstanceID)
 
 	e := echo.New()
 
-	// Request ids only, deliberately no request logger: /ws carries a token in
-	// its query string, and the surest way to keep it out of the logs is for
-	// this service to write no request logs at all. See README.
+	// Request ids only, deliberately no request logger: this service writes one
+	// log line per WebSocket connection (see ws.Handler.Serve) and nothing per
+	// request. See README.
 	e.Use(chatMiddleware.RequestIDMiddleware)
+	e.Use(chatMiddleware.InstanceHeaderMiddleware(cfg.InstanceID))
 
 	e.GET("/health", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	// Per-instance view: only the rooms THIS process's Hub holds. The gateway
+	// no longer proxies it (presence-service answers /rooms for the whole
+	// fleet); it stays here, reachable on this port directly, because "which
+	// instance holds room X" is what the month 3 verification needs to see.
 	e.GET("/rooms", handler.ListRooms, chatMiddleware.JWTMiddleware)
 	e.GET("/rooms/:room/messages", messageController.ListByRoom, chatMiddleware.JWTMiddleware)
 	e.GET("/ws", handler.Serve)

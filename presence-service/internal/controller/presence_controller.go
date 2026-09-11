@@ -12,8 +12,9 @@ import (
 )
 
 type HeartbeatRequest struct {
-	Room    string  `json:"room"`
-	UserIDs []int64 `json:"user_ids"`
+	Room       string  `json:"room"`
+	InstanceID string  `json:"instance_id"`
+	UserIDs    []int64 `json:"user_ids"`
 }
 
 type PresenceController struct {
@@ -46,11 +47,24 @@ func (pc *PresenceController) Heartbeat(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	if err := pc.presenceService.Heartbeat(request.Room, request.UserIDs); err != nil {
+	if err := pc.presenceService.Heartbeat(request.Room, request.InstanceID, request.UserIDs); err != nil {
 		return respondError(c, err, "failed to refresh presence")
 	}
 
 	return c.JSON(http.StatusAccepted, map[string]string{"message": "refreshed"})
+}
+
+// ListRooms handles GET /rooms: every room with someone online, fleet-wide.
+// This used to be answered by chat-service from its in-memory Hub; with several
+// instances each Hub only knows its own rooms, and Redis is the one place that
+// sees all of them.
+func (pc *PresenceController) ListRooms(c echo.Context) error {
+	rooms, err := pc.presenceService.ListRooms()
+	if err != nil {
+		return respondError(c, err, "failed to list rooms")
+	}
+
+	return c.JSON(http.StatusOK, rooms)
 }
 
 func (pc *PresenceController) GetRoom(c echo.Context) error {

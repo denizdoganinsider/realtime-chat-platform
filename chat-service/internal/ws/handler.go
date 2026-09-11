@@ -38,14 +38,16 @@ func NewUpgrader(allowedOrigins []string) websocket.Upgrader {
 }
 
 type Handler struct {
-	hub      *Hub
-	upgrader websocket.Upgrader
+	hub        *Hub
+	upgrader   websocket.Upgrader
+	instanceID string
 }
 
-func NewHandler(hub *Hub, allowedOrigins []string) *Handler {
+func NewHandler(hub *Hub, allowedOrigins []string, instanceID string) *Handler {
 	return &Handler{
-		hub:      hub,
-		upgrader: NewUpgrader(allowedOrigins),
+		hub:        hub,
+		upgrader:   NewUpgrader(allowedOrigins),
+		instanceID: instanceID,
 	}
 }
 
@@ -75,7 +77,13 @@ func (h *Handler) Serve(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
 	}
 
-	conn, err := h.upgrader.Upgrade(c.Response(), c.Request(), nil)
+	// gorilla writes the 101 itself after hijacking the connection, so headers
+	// set on the ResponseWriter (the instance middleware's) never make it out.
+	// Passing it here puts it on the handshake response, which the gateway's
+	// reverse proxy copies through to the client.
+	conn, err := h.upgrader.Upgrade(c.Response(), c.Request(), http.Header{
+		chatMiddleware.InstanceHeader: {h.instanceID},
+	})
 	if err != nil {
 		return err
 	}
@@ -102,6 +110,19 @@ func (h *Handler) Serve(c echo.Context) error {
 
 	go client.writePump()
 	go client.readPump()
+
+	// The one line this service logs per connection, and the other half of the
+	// gateway's "proxying request" line: same request_id, so the pair proves
+	// which instance a room's connections landed on. Safe to log now - the
+	// ticket was stripped at the gateway and the token travelled in a header.
+	requestID, _ := c.Get(chatMiddleware.RequestIDKey).(string)
+	slog.Info("websocket connected",
+		"service", "chat-service",
+		"instance", h.instanceID,
+		"room", roomName,
+		"user_id", claims.UserID,
+		"request_id", requestID,
+	)
 
 	return nil
 }
