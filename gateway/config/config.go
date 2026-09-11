@@ -3,6 +3,8 @@ package config
 import (
 	"log"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -13,22 +15,28 @@ type Config struct {
 	DBName             string
 	JWTSecret          string
 	ServerPort         string
-	ChatServiceURL     string
+	ChatServiceURLs    []string
 	PresenceServiceURL string
+
+	LBHealthIntervalSecs int
 }
 
 func LoadConfig() *Config {
 	return &Config{
-		DBHost:         getEnv("DB_HOST", "localhost"),
-		DBPort:         getEnv("DB_PORT", "3307"),
-		DBUser:         getEnv("DB_USER", "root"),
-		DBPassword:     getEnv("DB_PASSWORD", "root"),
-		DBName:         getEnv("DB_NAME", "chat_gateway_db"),
-		JWTSecret:      requireEnv("JWT_SECRET"),
-		ServerPort:     getEnv("SERVER_PORT", "8000"),
-		ChatServiceURL: getEnv("CHAT_SERVICE_URL", "http://localhost:8001"),
+		DBHost:     getEnv("DB_HOST", "localhost"),
+		DBPort:     getEnv("DB_PORT", "3307"),
+		DBUser:     getEnv("DB_USER", "root"),
+		DBPassword: getEnv("DB_PASSWORD", "root"),
+		DBName:     getEnv("DB_NAME", "chat_gateway_db"),
+		JWTSecret:  requireEnv("JWT_SECRET"),
+		ServerPort: getEnv("SERVER_PORT", "8000"),
+		// Comma-separated. One entry is the month 1-2 setup; two or more is
+		// month 3, where the gateway load-balances across them.
+		ChatServiceURLs: getEnvList("CHAT_SERVICE_URLS", []string{"http://localhost:8001"}),
 
 		PresenceServiceURL: getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
+
+		LBHealthIntervalSecs: getEnvInt("LB_HEALTH_INTERVAL_SECONDS", 5),
 	}
 }
 
@@ -47,4 +55,35 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("%s is not a positive integer (%q), falling back to %d", key, value, fallback)
+		return fallback
+	}
+
+	return parsed
+}
+
+func getEnvList(key string, fallback []string) []string {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+
+	var values []string
+	for part := range strings.SplitSeq(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+
+	return values
 }

@@ -27,13 +27,18 @@ const (
 type PresenceClient struct {
 	baseURL    string
 	apiKey     string
+	instanceID string
 	httpClient *http.Client
 }
 
-func NewPresenceClient(baseURL string, apiKey string) *PresenceClient {
+// instanceID is stamped on every event and heartbeat, so presence-service can
+// tell this process's entries apart from a sibling's - the client owns it
+// rather than every caller, because no event can correctly go out without it.
+func NewPresenceClient(baseURL string, apiKey string, instanceID string) *PresenceClient {
 	return &PresenceClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
+		baseURL:    baseURL,
+		apiKey:     apiKey,
+		instanceID: instanceID,
 		httpClient: &http.Client{
 			Timeout: presenceRequestTimeout,
 			// Every request goes to the same host, so keeping idle connections
@@ -44,14 +49,16 @@ func NewPresenceClient(baseURL string, apiKey string) *PresenceClient {
 }
 
 func (s *PresenceClient) SendEvent(ctx context.Context, event domain.PresenceEvent) error {
+	event.InstanceID = s.instanceID
 	return s.post(ctx, "/events", event, presenceMaxRetries)
 }
 
 func (s *PresenceClient) SendHeartbeat(ctx context.Context, room string, userIDs []int64) error {
 	body := struct {
-		Room    string  `json:"room"`
-		UserIDs []int64 `json:"user_ids"`
-	}{Room: room, UserIDs: userIDs}
+		Room       string  `json:"room"`
+		InstanceID string  `json:"instance_id"`
+		UserIDs    []int64 `json:"user_ids"`
+	}{Room: room, InstanceID: s.instanceID, UserIDs: userIDs}
 
 	return s.post(ctx, "/heartbeat", body, heartbeatMaxRetries)
 }

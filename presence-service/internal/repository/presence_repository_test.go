@@ -43,10 +43,10 @@ func newTestRepository(t *testing.T, ttl time.Duration) *PresenceRepository {
 func TestSetOnlineThenListOnline(t *testing.T) {
 	r := newTestRepository(t, time.Minute)
 
-	if err := r.SetOnline("general", 2); err != nil {
+	if err := r.SetOnline("general", 2, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
-	if err := r.SetOnline("general", 1); err != nil {
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestSetOnlineIsIdempotent(t *testing.T) {
 	r := newTestRepository(t, time.Minute)
 
 	for range 3 {
-		if err := r.SetOnline("general", 1); err != nil {
+		if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 			t.Fatalf("SetOnline returned error: %v", err)
 		}
 	}
@@ -82,10 +82,10 @@ func TestSetOnlineIsIdempotent(t *testing.T) {
 func TestSetOfflineRemovesTheUser(t *testing.T) {
 	r := newTestRepository(t, time.Minute)
 
-	if err := r.SetOnline("general", 1); err != nil {
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
-	if err := r.SetOffline("general", 1); err != nil {
+	if err := r.SetOffline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOffline returned error: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestSetOfflineRemovesTheUser(t *testing.T) {
 func TestEntriesExpireByScore(t *testing.T) {
 	r := newTestRepository(t, 200*time.Millisecond)
 
-	if err := r.SetOnline("general", 1); err != nil {
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
 
@@ -132,13 +132,13 @@ func TestEntriesExpireByScore(t *testing.T) {
 func TestRefreshExtendsExpiry(t *testing.T) {
 	r := newTestRepository(t, 300*time.Millisecond)
 
-	if err := r.SetOnline("general", 1); err != nil {
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
 
 	time.Sleep(200 * time.Millisecond)
 
-	if err := r.Refresh("general", []int64{1}); err != nil {
+	if err := r.Refresh("general", "chat-a", []int64{1}); err != nil {
 		t.Fatalf("Refresh returned error: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestRefreshExtendsExpiry(t *testing.T) {
 func TestRefreshWithNoUsersIsANoop(t *testing.T) {
 	r := newTestRepository(t, time.Minute)
 
-	if err := r.Refresh("general", nil); err != nil {
+	if err := r.Refresh("general", "chat-a", nil); err != nil {
 		t.Errorf("Refresh returned error: %v", err)
 	}
 }
@@ -164,10 +164,10 @@ func TestRefreshWithNoUsersIsANoop(t *testing.T) {
 func TestRoomsAreIsolated(t *testing.T) {
 	r := newTestRepository(t, time.Minute)
 
-	if err := r.SetOnline("general", 1); err != nil {
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
-	if err := r.SetOnline("random", 2); err != nil {
+	if err := r.SetOnline("random", 2, "chat-a"); err != nil {
 		t.Fatalf("SetOnline returned error: %v", err)
 	}
 
@@ -178,5 +178,210 @@ func TestRoomsAreIsolated(t *testing.T) {
 
 	if !slices.Equal(users, []int64{1}) {
 		t.Errorf("ListOnline(general) = %v, want [1]", users)
+	}
+}
+
+// The month 3 flaw, fixed: user 1 is connected through two instances. Instance
+// A's offline must remove only A's entry, or B's still-open socket would show
+// the user as gone.
+func TestOfflineFromOneInstanceDoesNotClobberAnother(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 1, "chat-b"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOffline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOffline returned error: %v", err)
+	}
+
+	users, err := r.ListOnline("general")
+	if err != nil {
+		t.Fatalf("ListOnline returned error: %v", err)
+	}
+	if !slices.Equal(users, []int64{1}) {
+		t.Errorf("ListOnline = %v, want [1] - instance B's entry was clobbered", users)
+	}
+
+	if err := r.SetOffline("general", 1, "chat-b"); err != nil {
+		t.Fatalf("SetOffline returned error: %v", err)
+	}
+
+	users, err = r.ListOnline("general")
+	if err != nil {
+		t.Fatalf("ListOnline returned error: %v", err)
+	}
+	if len(users) != 0 {
+		t.Errorf("ListOnline = %v, want empty once both instances reported offline", users)
+	}
+}
+
+// One person, two instances, one entry in the sidebar.
+func TestListOnlineCollapsesInstances(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 7, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.Refresh("general", "chat-b", []int64{7, 3}); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	users, err := r.ListOnline("general")
+	if err != nil {
+		t.Fatalf("ListOnline returned error: %v", err)
+	}
+	if !slices.Equal(users, []int64{3, 7}) {
+		t.Errorf("ListOnline = %v, want [3 7]", users)
+	}
+}
+
+func TestListRoomsSeesEveryInstance(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 1, "chat-b"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.Refresh("random", "chat-b", []int64{2, 3}); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+
+	want := []RoomCount{{Name: "general", Count: 1}, {Name: "random", Count: 2}}
+	if !slices.Equal(rooms, want) {
+		t.Errorf("ListRooms = %v, want %v (sorted, users collapsed across instances)", rooms, want)
+	}
+}
+
+func TestListRoomsDropsARoomWhenTheLastUserLeaves(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOffline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOffline returned error: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if len(rooms) != 0 {
+		t.Errorf("ListRooms = %v, want empty", rooms)
+	}
+}
+
+// A room whose instance was kill -9'd: nobody sends an offline, and the room
+// falls out of the list by score expiry exactly as its users do.
+func TestListRoomsExpiresByScore(t *testing.T) {
+	r := newTestRepository(t, 200*time.Millisecond)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if len(rooms) != 0 {
+		t.Errorf("ListRooms = %v, want empty after the TTL elapsed", rooms)
+	}
+}
+
+func TestListRoomsWithNothingOnlineIsEmptyNotNil(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if rooms == nil {
+		t.Error("ListRooms returned nil; it must marshal to [] not null")
+	}
+}
+
+// Month 2 wrote bare "<user_id>" members. An in-place upgrade reads them for up
+// to one TTL; they must count as that user, not as a 500.
+func TestListOnlineReadsLegacyMembers(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	legacyScore := float64(time.Now().Add(time.Minute).UnixMilli())
+	if err := r.redisClient.ZAdd(context.Background(), roomKey("general"), redis.Z{Score: legacyScore, Member: "7"}).Err(); err != nil {
+		t.Fatalf("seeding legacy member: %v", err)
+	}
+	if err := r.SetOnline("general", 7, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 9, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+
+	users, err := r.ListOnline("general")
+	if err != nil {
+		t.Fatalf("ListOnline returned error on a legacy member: %v", err)
+	}
+	if !slices.Equal(users, []int64{7, 9}) {
+		t.Errorf("ListOnline = %v, want [7 9] (legacy 7 collapsed into 7:chat-a)", users)
+	}
+}
+
+// One room with garbage in it must not fail the fleet-wide listing.
+func TestListRoomsSkipsAnUnparseableRoom(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("broken", 2, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	score := float64(time.Now().Add(time.Minute).UnixMilli())
+	if err := r.redisClient.ZAdd(context.Background(), roomKey("broken"), redis.Z{Score: score, Member: "not-a-user"}).Err(); err != nil {
+		t.Fatalf("seeding bad member: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if !slices.Equal(rooms, []RoomCount{{Name: "general", Count: 1}}) {
+		t.Errorf("ListRooms = %v, want only general", rooms)
+	}
+}
+
+// The index race the Lua script closes: A's last user leaves while B's first
+// user joins the same room. The join must survive in /rooms.
+func TestOfflineDoesNotDropIndexWhenAnotherInstanceIsPresent(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 2, "chat-b"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOffline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOffline returned error: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if !slices.Equal(rooms, []RoomCount{{Name: "general", Count: 1}}) {
+		t.Errorf("ListRooms = %v, want general with B's user still listed", rooms)
 	}
 }
