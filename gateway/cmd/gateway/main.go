@@ -68,14 +68,10 @@ func main() {
 	e.Use(gatewayMiddleware.RequestIDMiddleware)
 	e.Use(gatewayMiddleware.LoggerMiddleware)
 
-	// The gateway's own health also reports what it knows about the pool, so
-	// "which instance does the gateway think is down" is one curl away.
+	// Liveness only. The gateway is the one public entry point, so this must
+	// not list internal instances - see /health/backends below.
 	e.GET("/health", func(c echo.Context) error {
-		backends := make([]map[string]any, 0, len(chatPool.Backends()))
-		for _, b := range chatPool.Backends() {
-			backends = append(backends, map[string]any{"backend": b.String(), "healthy": b.Healthy()})
-		}
-		return c.JSON(http.StatusOK, map[string]any{"status": "ok", "chat_service": backends})
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	e.POST("/register", authController.Register)
@@ -85,6 +81,18 @@ func main() {
 	auth.Use(gatewayMiddleware.JWTMiddleware)
 	auth.GET("/me", authController.Me)
 	auth.POST("/ws-ticket", ticketController.Issue)
+
+	// What the load balancer knows about the pool, so "which instance does the
+	// gateway think is down" is one curl away. Behind the Bearer token, not on
+	// the public /health: internal host:port pairs and which of them are
+	// degraded is topology, and an anonymous caller has no business with it.
+	auth.GET("/health/backends", func(c echo.Context) error {
+		backends := make([]map[string]any, 0, len(chatPool.Backends()))
+		for _, b := range chatPool.Backends() {
+			backends = append(backends, map[string]any{"backend": b.String(), "healthy": b.Healthy()})
+		}
+		return c.JSON(http.StatusOK, map[string]any{"chat_service": backends})
+	})
 
 	// Message history is a database read, so any chat-service instance can
 	// answer it: round-robin. The Bearer token is forwarded as-is and

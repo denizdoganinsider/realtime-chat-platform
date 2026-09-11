@@ -312,3 +312,76 @@ func TestListRoomsWithNothingOnlineIsEmptyNotNil(t *testing.T) {
 		t.Error("ListRooms returned nil; it must marshal to [] not null")
 	}
 }
+
+// Month 2 wrote bare "<user_id>" members. An in-place upgrade reads them for up
+// to one TTL; they must count as that user, not as a 500.
+func TestListOnlineReadsLegacyMembers(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	legacyScore := float64(time.Now().Add(time.Minute).UnixMilli())
+	if err := r.redisClient.ZAdd(context.Background(), roomKey("general"), redis.Z{Score: legacyScore, Member: "7"}).Err(); err != nil {
+		t.Fatalf("seeding legacy member: %v", err)
+	}
+	if err := r.SetOnline("general", 7, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 9, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+
+	users, err := r.ListOnline("general")
+	if err != nil {
+		t.Fatalf("ListOnline returned error on a legacy member: %v", err)
+	}
+	if !slices.Equal(users, []int64{7, 9}) {
+		t.Errorf("ListOnline = %v, want [7 9] (legacy 7 collapsed into 7:chat-a)", users)
+	}
+}
+
+// One room with garbage in it must not fail the fleet-wide listing.
+func TestListRoomsSkipsAnUnparseableRoom(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("broken", 2, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	score := float64(time.Now().Add(time.Minute).UnixMilli())
+	if err := r.redisClient.ZAdd(context.Background(), roomKey("broken"), redis.Z{Score: score, Member: "not-a-user"}).Err(); err != nil {
+		t.Fatalf("seeding bad member: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if !slices.Equal(rooms, []RoomCount{{Name: "general", Count: 1}}) {
+		t.Errorf("ListRooms = %v, want only general", rooms)
+	}
+}
+
+// The index race the Lua script closes: A's last user leaves while B's first
+// user joins the same room. The join must survive in /rooms.
+func TestOfflineDoesNotDropIndexWhenAnotherInstanceIsPresent(t *testing.T) {
+	r := newTestRepository(t, time.Minute)
+
+	if err := r.SetOnline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOnline("general", 2, "chat-b"); err != nil {
+		t.Fatalf("SetOnline returned error: %v", err)
+	}
+	if err := r.SetOffline("general", 1, "chat-a"); err != nil {
+		t.Fatalf("SetOffline returned error: %v", err)
+	}
+
+	rooms, err := r.ListRooms()
+	if err != nil {
+		t.Fatalf("ListRooms returned error: %v", err)
+	}
+	if !slices.Equal(rooms, []RoomCount{{Name: "general", Count: 1}}) {
+		t.Errorf("ListRooms = %v, want general with B's user still listed", rooms)
+	}
+}

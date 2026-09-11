@@ -365,11 +365,13 @@ so the two ways of naming the default room cannot split across instances.
 
 The gateway polls every instance's `/health` every `LB_HEALTH_INTERVAL_SECONDS`
 (one synchronous sweep at startup, so the very first request already sees the
-truth). Its own `/health` reports what it knows:
+truth). `GET /health/backends` — behind the Bearer token, because internal
+host:port pairs and which of them are degraded is topology an anonymous caller
+on the public entry point has no business with — reports what it knows:
 
 ```json
-{"status":"ok","chat_service":[{"backend":"localhost:8001","healthy":true},
-                               {"backend":"localhost:8011","healthy":false}]}
+{"chat_service":[{"backend":"localhost:8001","healthy":true},
+                 {"backend":"localhost:8011","healthy":false}]}
 ```
 
 Round-robin routes around a dead instance. Consistent hash **does not**. The
@@ -393,10 +395,24 @@ presence-service and proxied by the gateway. chat-service keeps its own
 `/rooms`, reachable on its port directly and not through the gateway — that
 per-instance view is how the verification below proves stickiness.
 
+The body changed with the move, and the change is semantic, not cosmetic:
+
+```
+chat-service     GET :8001/rooms   [{"name":"general","clients":2}]   sockets on this instance
+presence-service GET :8000/rooms   [{"name":"general","count":2}]     distinct users, all instances
+```
+
+`clients` counts connections — one user with two tabs is two — and only the
+ones this process holds. `count` is distinct users fleet-wide, the same number
+`/presence/:room` reports. A client that read `clients` needs to read `count`.
+
 To make it cheap, presence writes maintain a `presence:rooms` index ZSET as a
 by-product (same expiry-score scheme as the rooms themselves), rather than the
 read path doing a `SCAN` over the keyspace. The last `offline` out of a room
-drops it from the index; a `kill -9`'d instance's rooms fall out by score.
+drops it from the index — "is the room empty" and "remove it from the index"
+run as one Lua script, because as two round trips a join on another instance
+could land between them and have its index entry deleted out from under it. A
+`kill -9`'d instance's rooms fall out by score.
 
 ### The presence flaw month 2 named, fixed
 
@@ -412,11 +428,19 @@ presence:rooms         member = "<room>"                    score = expiry epoch
 A's `ZREM` touches only A's entry, each instance's heartbeat re-stamps only
 its own members, and the read path collapses the instances back to one user
 id. `INSTANCE_ID` defaults to `chat-<port>` (two instances on one machine
-differ only by port); a real deployment sets a hostname. presence-service
-validates it — no colons, since it sits after one in the member — and the
-event and heartbeat bodies both carry it. This is the second wire-contract
-change between the two services, and, as with the first, they change together
-and share no code.
+differ only by port); a real deployment sets a hostname. The rule — up to 64
+of `[A-Za-z0-9_.-]`, no colons, since it sits after one in the member — is
+enforced twice: chat-service refuses to start on a bad id, and presence-service
+rejects one on the wire with `400`. The first check exists because of the
+second: chat-service treats a `400` as final and does not retry, so without a
+startup check an instance with a bad id would run for its whole life with
+presence silently broken. The event and heartbeat bodies both carry the id.
+This is the second wire-contract change between the two services, and, as with
+the first, they change together and share no code.
+
+The read path still accepts month 2's bare `<user_id>` members. An in-place
+upgrade against the same Redis holds them for up to one TTL, and answering
+`500` for that window would be a self-inflicted outage.
 
 ### Verification
 
@@ -462,7 +486,8 @@ Kill one instance mid-session:
 ```bash
 kill -9 $(lsof -ti :8011)
 sleep $LB_HEALTH_INTERVAL_SECONDS
-curl -s localhost:8000/health | jq -c .chat_service     # 8011 healthy:false
+curl -s localhost:8000/health/backends -H "Authorization: Bearer $TOKEN" \
+  | jq -c .chat_service                                  # 8011 healthy:false
 # a room hashed to 8011 => 503 "the instance serving this room is unavailable"
 # a room hashed to 8001 => connects as before
 # history => 200 every time, all from chat-8001

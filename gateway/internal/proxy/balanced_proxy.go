@@ -38,6 +38,16 @@ func NewBalancedProxy(pool *loadbalancer.Pool, strategy loadbalancer.Strategy) e
 			return respondUnavailable(c, strategy, requestID, err)
 		}
 
+		// A strategy built over a different pool than this proxy would return a
+		// backend with no proxy here. Nothing at compile time prevents that
+		// wiring mistake, so refuse the request instead of dereferencing nil.
+		rp, ok := proxies[backend]
+		if !ok {
+			slog.Error("strategy returned a backend outside this proxy's pool",
+				"service", "gateway", "strategy", strategy.Name(), "backend", backend.String(), "request_id", requestID)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "gateway misconfiguration"})
+		}
+
 		// backend is the proof the verification asks for: which instance this
 		// request_id went to. chat-service logs the same id on its side.
 		slog.Info("proxying request",
@@ -48,7 +58,7 @@ func NewBalancedProxy(pool *loadbalancer.Pool, strategy loadbalancer.Strategy) e
 			"request_id", requestID,
 		)
 
-		proxies[backend].ServeHTTP(c.Response(), c.Request())
+		rp.ServeHTTP(c.Response(), c.Request())
 		return nil
 	}
 }

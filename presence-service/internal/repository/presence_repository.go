@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,28 +59,30 @@ func (r *PresenceRepository) SetOnline(room string, userID int64, instanceID str
 
 func (r *PresenceRepository) SetOffline(room string, userID int64, instanceID string) error {
 	ctx := context.Background()
-	key := roomKey(room)
-
-	pipe := r.redisClient.TxPipeline()
-	pipe.ZRem(ctx, key, member(userID, instanceID))
-	// A no-op if ZRem emptied (and therefore deleted) the key.
-	pipe.Expire(ctx, key, 2*r.ttl)
-	remaining := pipe.ZCard(ctx, key)
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
 
 	// Last one out drops the room from the index, so /rooms does not list an
-	// empty room for a TTL after everyone left. Racing a concurrent online is
-	// harmless: that online re-adds the room in its own transaction, and the
-	// next heartbeat would anyway.
-	if remaining.Val() == 0 {
-		return r.redisClient.ZRem(ctx, roomsIndexKey, room).Err()
-	}
-
-	return nil
+	// empty room for a TTL after everyone left. The "is it empty" check and the
+	// index removal run as one script, because as two round trips a join on
+	// another instance could land between them and have its index entry
+	// deleted out from under it. (The room's own EXPIRE is refreshed too; it is
+	// a no-op if ZREM emptied and therefore deleted the key.)
+	return offlineScript.Run(ctx, r.redisClient,
+		[]string{roomKey(room), roomsIndexKey},
+		member(userID, instanceID), room, int64(2*r.ttl/time.Second),
+	).Err()
 }
+
+// KEYS[1] = room key, KEYS[2] = rooms index; ARGV[1] = member, ARGV[2] = room,
+// ARGV[3] = key TTL in seconds.
+var offlineScript = redis.NewScript(`
+redis.call('ZREM', KEYS[1], ARGV[1])
+if redis.call('ZCARD', KEYS[1]) == 0 then
+  redis.call('ZREM', KEYS[2], ARGV[2])
+else
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+end
+return 0
+`)
 
 // Refresh re-stamps every user this instance currently has connected, in one
 // round trip. It is idempotent, and each instance only ever writes its own
@@ -169,11 +172,14 @@ func (r *PresenceRepository) ListRooms() ([]RoomCount, error) {
 
 		users, err := collapseUsers(raw)
 		if err != nil {
-			return nil, err
+			// One room with a member nobody can parse must not take the whole
+			// fleet-wide listing down with it.
+			slog.Warn("skipping room with malformed presence members",
+				"service", "presence-service", "room", room, "error", err)
+			continue
 		}
 
-		// The index can lag the room by one write (an offline that raced the
-		// index removal); an empty room is simply not a room anyone is in.
+		// An empty room is simply not a room anyone is in.
 		if len(users) == 0 {
 			continue
 		}
@@ -208,16 +214,18 @@ func (r *PresenceRepository) touchRoomIndex(ctx context.Context, pipe redis.Pipe
 // collapseUsers turns "<user_id>:<instance_id>" members back into one sorted,
 // deduplicated user id list - a user connected through two instances is one
 // person as far as the sidebar is concerned.
+//
+// A bare "<user_id>" with no instance suffix is the month 2 format. It is read
+// as that user rather than rejected: a presence-service upgraded in place
+// against the same Redis still holds month 2 members for up to one TTL, and
+// answering 500 for that window would be a self-inflicted outage.
 func collapseUsers(raw []string) ([]int64, error) {
 	seen := make(map[int64]bool, len(raw))
 	// Non-nil empty slice: an empty room must marshal to [] rather than null.
 	userIDs := make([]int64, 0, len(raw))
 
 	for _, m := range raw {
-		idPart, _, found := strings.Cut(m, ":")
-		if !found {
-			return nil, fmt.Errorf("malformed presence member %q: missing instance id", m)
-		}
+		idPart, _, _ := strings.Cut(m, ":")
 
 		userID, err := strconv.ParseInt(idPart, 10, 64)
 		if err != nil {
