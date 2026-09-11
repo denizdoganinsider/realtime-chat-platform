@@ -12,13 +12,17 @@ Remaining concepts from the source material and the month they're addressed:
 | Reverse Proxy       | 1 |
 | WebSocket           | 1 |
 | Load Balancer       | 3 |
-| CDN                 | 4 (planned) |
+| CDN                 | 4 |
 
-## Architecture (Months 1-3)
+All five are done. Webhooks, retry/backoff and HMAC signing come back in month
+4 from the predecessor project.
 
-Three independently deployable Go services, tied together for local development
+## Architecture (Months 1-4)
+
+Five independently deployable Go services, tied together for local development
 via a Go workspace (`go.work`). From month 3 chat-service runs as **N
-instances** behind the gateway:
+instances** behind the gateway; month 4 adds notification-service and
+media-service, drawn below the line because they are the leaves of the graph:
 
 ```
                     ┌─────────────┐          ┌──────────────┐
@@ -40,7 +44,21 @@ instances** behind the gateway:
                     │  (users)             │                   ┌──────▼──────┐
                     │ chat_service_db      │                   │    Redis     │
                     │  (messages)          │                   │ (presence)   │
-                    └─────────────────────┘                   └─────────────┘
+                    │ notification_svc_db  │                   └─────────────┘
+                    └─────────────────────┘
+       ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+                     message events (HTTP)             who is offline (HTTP)
+   chat-service ───────────────────────▶ notification-service ◀──────── presence-service
+                                          │  :8003
+   gateway ──── /webhook /subscriptions ──┤  - webhooks + subscriptions (MySQL)
+             (edge auth: X-User-ID)       │  - fan-out + signed delivery, retries
+                                          ▼
+                                     user's webhook receiver
+
+   gateway ──── POST /media ─────────────▶ media-service  :8004
+     │          (edge auth)                 content-addressed files on disk
+     └───────── GET /media/:hash ─────────▶ (origin, on cache MISS only)
+          in-memory edge cache: ETag, immutable, 304, X-Cache
 ```
 
 - **gateway** is the only public entry point. It owns authentication
@@ -63,6 +81,14 @@ instances** behind the gateway:
   instances tell it about joins and leaves over HTTP; it never reaches into
   chat-service, and chat-service never reaches into its Redis. Because it is
   the one component that sees every instance, it also answers `/rooms`.
+- **notification-service** owns webhooks: a user's registered endpoint, the
+  rooms they subscribe to, and a delivery log. chat-service tells it about
+  every chat message; it asks presence-service who is offline, and POSTs a
+  signed body to each offline subscriber with retries. Its MySQL schema is its
+  own, like everyone else's.
+- **media-service** is a content-addressed file store: the URL of a file is
+  the SHA-256 of its bytes. The gateway fronts it with an in-memory **edge
+  cache**, which is the CDN lesson.
 - **Database per service.** The gateway owns `chat_gateway_db` (users);
   chat-service owns `chat_service_db` (messages). Same container, separate
   schemas, and `messages.user_id` has **no foreign key** to `users` — MySQL
@@ -114,17 +140,39 @@ cd chat-service && JWT_SECRET=my-secret-key PRESENCE_API_KEY=dev-presence-key \
 cd chat-service && JWT_SECRET=my-secret-key PRESENCE_API_KEY=dev-presence-key \
   SERVER_PORT=8011 go run ./cmd/chat                                 # :8011
 
-# 4. gateway, told about both
-cd gateway && JWT_SECRET=my-secret-key \
+# 4. notification-service (month 4) - loopback webhooks are opt-in, for the
+#    local receiver in the verification
+cd notification-service && GATEWAY_SHARED_KEY=dev-gateway-key \
+  NOTIFICATION_API_KEY=dev-notification-key PRESENCE_API_KEY=dev-presence-key \
+  WEBHOOK_ALLOW_LOOPBACK=true go run ./cmd/notification                # :8003
+
+# 5. media-service (month 4)
+cd media-service && GATEWAY_SHARED_KEY=dev-gateway-key go run ./cmd/media   # :8004
+
+# 6. gateway, told about both chat instances
+cd gateway && JWT_SECRET=my-secret-key GATEWAY_SHARED_KEY=dev-gateway-key \
   CHAT_SERVICE_URLS=http://localhost:8001,http://localhost:8011 \
   go run ./cmd/gateway                                               # :8000
 ```
 
-`JWT_SECRET` and `PRESENCE_API_KEY` have **no defaults** — every service that
-needs one fails fast at startup if it is unset, on purpose: a predictable
-default would let anyone forge tokens or impersonate chat-service. `JWT_SECRET`
-must match across all three (shared secret, not shared code — see Architecture);
-`PRESENCE_API_KEY` must match between chat-service and presence-service.
+chat-service also needs `NOTIFICATION_API_KEY=dev-notification-key` from month
+4 on (omitted above for width). **Upgrading a running months 1-3 setup:** set
+`GATEWAY_SHARED_KEY` (gateway) and `NOTIFICATION_API_KEY` (chat-service) in
+the environment *before* restarting either binary — both are required with no
+default, and a binary rolled ahead of its config exits at startup.
+
+Every secret has **no default** — a service that needs one fails fast at
+startup if it is unset, on purpose: a predictable default would let anyone
+forge tokens or impersonate a service. Which must match which:
+
+| Secret | Shared between |
+|---|---|
+| `JWT_SECRET` | gateway, chat-service, presence-service |
+| `PRESENCE_API_KEY` | presence-service ← chat-service, notification-service |
+| `NOTIFICATION_API_KEY` | notification-service ← chat-service |
+| `GATEWAY_SHARED_KEY` | gateway → notification-service, media-service |
+
+Shared secret, not shared code — see Architecture and month 4.
 
 ### Configuration
 
@@ -133,6 +181,11 @@ must match across all three (shared secret, not shared code — see Architecture
 | gateway | `CHAT_SERVICE_URLS` | `http://localhost:8001` (comma-separated) |
 | gateway | `LB_HEALTH_INTERVAL_SECONDS` | `5` |
 | gateway | `PRESENCE_SERVICE_URL` | `http://localhost:8002` |
+| gateway | `NOTIFICATION_SERVICE_URL` | `http://localhost:8003` |
+| gateway | `MEDIA_SERVICE_URL` | `http://localhost:8004` |
+| gateway | `GATEWAY_SHARED_KEY` | *required* |
+| gateway | `EDGE_CACHE_MAX_BYTES` | `67108864` (64 MiB) |
+| gateway | `EDGE_CACHE_MAX_OBJECT_BYTES` | `5242880` (5 MiB) |
 | chat-service | `SERVER_PORT` | `8001` |
 | chat-service | `INSTANCE_ID` | `chat-<SERVER_PORT>` |
 | chat-service | `DB_NAME` | `chat_service_db` |
@@ -140,8 +193,20 @@ must match across all three (shared secret, not shared code — see Architecture
 | chat-service | `PRESENCE_API_KEY` | *required* |
 | chat-service | `PRESENCE_HEARTBEAT_SECONDS` | `30` (keep below TTL/2) |
 | chat-service | `WS_ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:8000` |
+| chat-service | `NOTIFICATION_SERVICE_URL` | `http://localhost:8003` |
+| chat-service | `NOTIFICATION_API_KEY` | *required* |
 | presence-service | `REDIS_ADDR` | `localhost:6380` |
 | presence-service | `PRESENCE_TTL_SECONDS` | `90` |
+| notification-service | `DB_NAME` | `notification_service_db` |
+| notification-service | `GATEWAY_SHARED_KEY` | *required* |
+| notification-service | `NOTIFICATION_API_KEY` | *required* |
+| notification-service | `PRESENCE_SERVICE_URL` | `http://localhost:8002` |
+| notification-service | `PRESENCE_API_KEY` | *required* |
+| notification-service | `DELIVERY_WORKERS` | `4` |
+| notification-service | `WEBHOOK_ALLOW_LOOPBACK` | `false` |
+| media-service | `MEDIA_DIR` | `./data/media` |
+| media-service | `GATEWAY_SHARED_KEY` | *required* |
+| media-service | `MAX_UPLOAD_BYTES` | `5242880` (5 MiB) |
 
 `WS_ALLOWED_ORIGINS` closes month 1's other gap: `upgrader.CheckOrigin` used to
 return `true` unconditionally. A **missing** `Origin` header is still allowed —
@@ -158,6 +223,7 @@ does nothing to a database that already exists. Either:
 ```bash
 # non-destructive (keeps registered users)
 docker exec -i chat_gateway_mysql mysql -uroot -proot < db/chat_schema.sql
+docker exec -i chat_gateway_mysql mysql -uroot -proot < db/notification_schema.sql
 
 # or full reset
 docker-compose down -v && docker-compose up -d
@@ -496,43 +562,204 @@ curl -s localhost:8000/health/backends -H "Authorization: Bearer $TOKEN" \
 Start it again and its rooms are reachable within one health interval, on the
 same instance they were on before — nothing moved.
 
-## Roadmap (not yet implemented)
+## Month 4 — Notification Service + CDN
 
-### Month 4 — Notification Service + CDN
+Two new services, and the last two concepts from the source material. The
+month 3 roadmap said the notification service would be "the one component with
+the least new code", and that held: `Deliverer` is notification-api's
+`WebhookDeliveryService` with three changes, each of which is the actual
+lesson.
 
-- **notification-service** (`:8003`): carries the webhook-delivery
-  machinery over from notification-api almost directly — when a message
-  arrives for a user who is offline (per presence-service), deliver a
-  webhook/push event to that user's registered endpoint, with the same
-  retry/exponential-backoff service already built once in that project.
-  This is the one component with the least new code — the point is
-  recognizing an already-solved problem, not re-solving it. HMAC-signed
-  bodies belong here too, which is why month 2's service-to-service calls
-  settled for a shared API key over localhost.
-- **CDN-style edge caching** for shared media (avatars, attachments): a
-  small **media-service** (`:8004`) storing files on local disk, fronted by
-  an in-memory "edge cache" layer in the gateway keyed by content hash —
-  `ETag`, `Cache-Control: immutable`, and conditional `GET` (`304`) support.
-  Not a real multi-region CDN (out of scope for a single machine), but the
-  actual HTTP mechanics a CDN relies on: content-addressed caching,
-  cache-hit/miss headers, and immutable-content invalidation-by-URL rather
-  than invalidation-by-purge.
-- **Verification**: upload an avatar, confirm the second `GET` for the same
-  content hash returns `304` and a cache-hit log line at the gateway
-  without a round-trip to media-service.
+### Auth at the edge: the fourth service re-evaluated the three copies
 
-Each month's plan will be fleshed out into its own implementation plan
-(scope, files, verification) right before that month starts, the same way
-months 1 to 3 were — this section is the standing outline, not the final word.
+Month 2's known trade-off said three copies of `jwt.go` is where the
+discipline stops being free, and a fourth service is the moment to re-evaluate.
+The two new services carry **no copy at all**. They do not see the token: the
+gateway validates it once, at the edge, and forwards the identity it
+established as `X-User-ID`, together with `X-Gateway-Key` as proof the
+request came through the gateway. Both headers are overwritten on the way
+through — whatever a client put in them is discarded — and `Authorization` is
+stripped, so a service that never receives the credential cannot leak it
+(`gateway/internal/proxy/trusted_proxy.go`).
+
+Sharing a key is sharing a config value, the line held since month 1. The
+trust it buys is exactly as good as the network boundary: a caller who can
+reach `:8003` directly *and* holds the key can claim any user id. That is true
+of every service-to-service key in this project, and is why none of them has a
+default.
+
+chat-service and presence-service keep their copies. Rewriting them to edge
+auth is a refactor of working code with no new lesson in it.
+
+### notification-service
+
+A user registers one endpoint (`PUT /webhook`, which mints and returns the
+secret — the only time it is ever shown) and subscribes to rooms
+(`POST /subscriptions`). chat-service POSTs every chat message to
+`/events/message`; the recipients of a message are its room's subscribers,
+minus the sender, minus everyone presence-service says is online (they saw it
+on their socket), keeping only those with an endpoint. Each gets a row in
+`deliveries` and a signed POST.
+
+Three departures from the predecessor's delivery loop:
+
+1. **The body is signed.** `X-Signature: sha256=HMAC(secret, "<X-Timestamp>.<body>")`.
+   The timestamp is inside the MAC: signing the body alone proves it came from
+   us but lets anyone who captured a delivery replay it forever, and a receiver
+   that rejects stale timestamps closes that. `Sign` and `Verify` live side by
+   side in `signer.go` so they cannot drift.
+2. **Backoff has jitter and is interruptible.** 1s, 2s, 4s plus up to 50%,
+   through a context — the predecessor's `time.Sleep` in a loop held a worker
+   hostage through shutdown. `4xx` is final (the receiver said no; sending it
+   again will not change its mind); `5xx` and transport errors retry.
+3. **Every attempt lands in a row**, not only the final failure in a log line.
+   `GET /deliveries` is the user's own audit trail, and what the verification
+   watches. The unique `(event_id, user_id)` key makes a replayed event a no-op
+   rather than a second webhook.
+
+Two things the predecessor did not have to think about:
+
+- **Nothing blocks the request path.** `/events/message` answers `202` the
+  moment the event is queued — chat-service's dispatcher is waiting on that
+  response and must not wait on N receivers. One fan-out worker (so an event's
+  reads happen once, in order), a pool of delivery workers (deliveries are
+  independent), bounded queues that drop and log when full: the same shape as
+  chat-service's `internal/dispatch`, for the same reason. Shutdown cancels
+  in-flight deliveries mid-backoff rather than waiting them out.
+- **The URL is validated as a target, not just as a URL.** This service POSTs
+  to whatever is registered, from inside the network, with a service identity.
+  A URL pointing at localhost, a private range or the link-local metadata
+  address is a request to use notification-service as a proxy into things the
+  user cannot reach themselves. The string check at registration is a
+  courtesy (a `400` now rather than a failed delivery later); the check that
+  holds is in the HTTP transport, which resolves the hostname itself at every
+  delivery and refuses to dial any forbidden address — because what a name
+  resolves to is decided by whoever controls its DNS, not by the string
+  (`ssrf.go`). Loopback is allowed only with `WEBHOOK_ALLOW_LOOPBACK=true`,
+  because the local receiver in the verification below runs on it.
+- **Shutdown drains.** Every event answered `202` gets its fan-out (so its
+  rows exist) and queued deliveries are attempted, within a budget; past it
+  the context is cancelled, in-flight retries end at once and are recorded as
+  failed. Nothing accepted disappears without a row or a log line.
+
+On the chat-service side, the room's one `Archive` call now fans into two
+queues — the database write and the message event — and the room does not
+know about the second. "This message is durable" is its whole statement; what
+durability entails is `internal/dispatch`'s business. When presence-service is
+unreachable the fan-out notifies every subscriber rather than none: a webhook
+to someone online is a duplicate they can ignore, a missing one to someone
+offline is the feature not working.
+
+### media-service and the edge cache
+
+media-service stores files on disk under the SHA-256 of their bytes
+(`POST /media`, multipart field `file`, images only, 5 MiB). The type is
+sniffed from the bytes, not read from the upload's header, because serving
+uploaded HTML or a scripted SVG from the API's origin is how a file store
+becomes an XSS vector. Upload the same bytes twice and you get the same URL.
+
+Content addressing is the property everything else rests on. Because the
+address *is* the content, this URL can never serve different bytes, and three
+headers follow from that:
+
+- `ETag` is the hash — which the URL already is, so a conditional `GET` is
+  answered from the URL alone, with no disk read, even for a hash that was
+  never uploaded.
+- `Cache-Control: public, max-age=31536000, immutable` tells every cache
+  between here and the browser that it need never revalidate.
+- `304 Not Modified` on a matching `If-None-Match`, so a cache that already
+  holds the bytes exchanges nothing but headers.
+
+The gateway's `GET /media/:hash` is not a reverse proxy — a proxy streams the
+body through, and a cache needs to keep it. `gateway/internal/edgecache` is a
+byte-bounded LRU (bounded in bytes, not entries: images vary too much for an
+entry count to mean anything) with a per-object cap so one large file cannot
+flush everything else for a single hit. On a miss it fetches the full object
+from media-service — even when the client sent `If-None-Match`, because
+forwarding the condition would yield a bodiless `304` and nothing to keep —
+stores it, and then answers the client's condition. On a hit, or a conditional
+hit, the origin never hears about the request. Concurrent misses for one hash
+coalesce onto a single origin fetch — fifty clients asking for a freshly
+linked avatar is one round trip, not fifty copies in memory. `X-Cache` says
+what happened: `HIT`, `MISS`, or `BYPASS` for an object the edge will not hold
+(over the per-object cap, or not marked immutable by the origin), which is
+streamed through uncached rather than turned into a permanent `502` because
+two services' size limits disagree. Only a `200` with an `ETag` and
+`Cache-Control: immutable` is kept: the origin decides what is cacheable and
+the edge obeys.
+
+Not a multi-region CDN — one process, one machine — but the HTTP mechanics a
+CDN runs on, including the one that matters most: there is no purge. Invalid
+content is not a thing; new content is a new URL.
+
+### Verification
+
+A receiver that verifies the signature the way a real integration would:
+
+```go
+mac := hmac.New(sha256.New, []byte(secret))
+mac.Write([]byte(r.Header.Get("X-Timestamp") + "."))
+mac.Write(body)
+valid := hmac.Equal([]byte("sha256="+hex.EncodeToString(mac.Sum(nil))),
+                    []byte(r.Header.Get("X-Signature")))
+```
+
+```bash
+JSON='Content-Type: application/json'   # TOKEN_A, TOKEN_B from the smoke test
+
+# A registers an endpoint (the secret is in this response and nowhere else)
+# and subscribes to general
+curl -s -X PUT localhost:8000/webhook -H "$JSON" -H "Authorization: Bearer $TOKEN_A" \
+  -d '{"url":"http://localhost:9000/hook"}' | jq
+curl -s -X POST localhost:8000/subscriptions -H "$JSON" -H "Authorization: Bearer $TOKEN_A" \
+  -d '{"room":"general"}'
+
+# B sends a message in general while A has no socket open
+# => the receiver logs one call with valid=true, and:
+curl -s localhost:8000/deliveries -H "Authorization: Bearer $TOKEN_A" | jq -c '.[0]'
+# => {"status":"delivered","attempts":1,"last_status":200,...}
+
+# A connects to general and B sends again => A sees it on the socket, and the
+# receiver is NOT called
+# receiver answering 503 to its first two calls => {"status":"delivered","attempts":3}
+
+# these are refused
+curl -s -X PUT localhost:8003/webhook -H "X-User-ID: 1" -d '{"url":"..."}'   # no gateway key
+curl -s -X PUT localhost:8000/webhook ... -d '{"url":"http://169.254.169.254/latest"}'
+```
+
+```bash
+# upload, then read twice
+HASH=$(curl -s -X POST localhost:8000/media -H "Authorization: Bearer $TOKEN_A" \
+  -F file=@avatar.png | jq -r .hash)
+curl -si localhost:8000/media/$HASH | grep -E 'X-Cache|ETag|Cache-Control'
+# => X-Cache: MISS   ETag: "<hash>"   Cache-Control: public, max-age=31536000, immutable
+curl -si localhost:8000/media/$HASH | grep X-Cache                        # => HIT
+curl -si localhost:8000/media/$HASH -H "If-None-Match: \"$HASH\"" | head -1  # => 304
+grep "\"path\":\"/media/$HASH\"" media-service.log | wc -l                # => 1
+curl -s localhost:8000/health/edge-cache -H "Authorization: Bearer $TOKEN_A"
+# => {"entries":1,"used_bytes":73,"max_bytes":67108864,"hits":2,"misses":1}
+```
+
+One origin fetch, however many reads: that is the line the roadmap asked for.
 
 ## Known trade-offs
 
-- **Three copies of `jwt.go`.** Deliberate: a shared `internal/auth` module
-  would couple three independently deployable services at build time, which is
-  exactly what "share a config value, not a code library" rules out. Worth
-  naming the cost honestly though — three copies is roughly where the discipline
-  stops being free, and a fourth service is the moment to re-evaluate rather
-  than copy again.
+- **Three copies of `jwt.go`, and two services with none.** Month 4 answered
+  the "re-evaluate at the fourth service" note with edge auth rather than a
+  shared module, so the count stopped at three. Moving chat-service and
+  presence-service onto edge auth as well would be consistent, and is a
+  refactor with no new lesson in it, so it was not done.
+- **Webhook secrets are stored in the clear.** Signing needs the value, not a
+  hash of it. The secret protects the receiver from forged calls; it does not
+  protect the `webhooks` table, and a real deployment encrypts that column.
+- **The delivery queue is in memory.** A graceful stop drains it; a crash
+  loses whatever was queued, and rows that reached fan-out stay `pending` and
+  say so. A durable outbox (poll the table for due rows) is the next step and
+  is exactly what notification-api did not have either.
+- **The edge cache is per gateway process.** Two gateways are two caches. A
+  real CDN's edges are also independent — that is the point of a CDN — but
+  they share an origin shield, and this one has no such tier.
 - **Presence is eventually consistent by design.** Events can be dropped when a
   queue is full; the heartbeat is the source of truth. Exact presence would need
   a different design, and a chat sidebar does not need one.

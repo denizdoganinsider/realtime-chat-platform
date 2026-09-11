@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"realtime-chat-platform/chat-service/internal/domain"
+	"realtime-chat-platform/chat-service/internal/middleware"
 )
 
 // Consumer-side interfaces, satisfied by service.PresenceClient and
@@ -24,11 +25,25 @@ type MessageCreator interface {
 	Create(room string, userID int64, content string, createdAt time.Time) error
 }
 
+type MessageEventSender interface {
+	SendMessageEvent(ctx context.Context, event domain.MessageEvent) error
+}
+
 const (
 	presenceQueueSize = 256
 	archiveQueueSize  = 1024
+	notifyQueueSize   = 1024
 
 	presenceEventTimeout = 30 * time.Second
+	notifyEventTimeout   = 30 * time.Second
+	// During shutdown one event must not hold the drain for its full retry
+	// budget; enough for one attempt and a short retry, no more.
+	notifyDrainTimeout = 3 * time.Second
+
+	// A pool, unlike the presence worker: message events carry their own id
+	// and timestamp, so their order does not matter, and a notification-service
+	// brownout must not let one event's retry budget stall every other event.
+	notifyWorkers = 4
 )
 
 type presenceEvent struct {
@@ -38,6 +53,7 @@ type presenceEvent struct {
 }
 
 type archiveEvent struct {
+	eventID   string
 	room      string
 	userID    int64
 	content   string
@@ -45,11 +61,13 @@ type archiveEvent struct {
 }
 
 type Dispatcher struct {
-	presenceClient PresenceSender
-	messageService MessageCreator
+	presenceClient     PresenceSender
+	messageService     MessageCreator
+	notificationClient MessageEventSender
 
 	presenceQ chan presenceEvent
 	archiveQ  chan archiveEvent
+	notifyQ   chan archiveEvent
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -57,18 +75,25 @@ type Dispatcher struct {
 }
 
 // NewDispatcher starts its workers itself, matching NewHub and NewRoom.
-func NewDispatcher(presenceClient PresenceSender, messageService MessageCreator) *Dispatcher {
+// notificationClient may be nil, in which case messages are archived but no
+// message events leave the process.
+func NewDispatcher(presenceClient PresenceSender, messageService MessageCreator, notificationClient MessageEventSender) *Dispatcher {
 	d := &Dispatcher{
-		presenceClient: presenceClient,
-		messageService: messageService,
-		presenceQ:      make(chan presenceEvent, presenceQueueSize),
-		archiveQ:       make(chan archiveEvent, archiveQueueSize),
-		stop:           make(chan struct{}),
+		presenceClient:     presenceClient,
+		messageService:     messageService,
+		notificationClient: notificationClient,
+		presenceQ:          make(chan presenceEvent, presenceQueueSize),
+		archiveQ:           make(chan archiveEvent, archiveQueueSize),
+		notifyQ:            make(chan archiveEvent, notifyQueueSize),
+		stop:               make(chan struct{}),
 	}
 
-	d.wg.Add(2)
+	d.wg.Add(2 + notifyWorkers)
 	go d.runPresenceWorker()
 	go d.runArchiveWorker()
+	for range notifyWorkers {
+		go d.runNotifyWorker()
+	}
 
 	return d
 }
@@ -90,13 +115,39 @@ func (d *Dispatcher) Notify(room string, userID int64, status domain.PresenceSta
 // Archive implements ws.MessageArchiver. It never blocks and never fails: a full
 // queue drops the message and says so in the logs, which is the honest failure
 // mode - the alternative is stalling every client in the room behind a slow disk.
+//
+// One call from the room fans into two queues here: the database write and the
+// message event to notification-service (month 4). The room does not know about
+// the second - "this message is durable" is its whole statement, and what
+// durability entails is this package's business. The two queues are separate so
+// a slow notification-service cannot delay a database write, or vice versa.
 func (d *Dispatcher) Archive(room string, userID int64, content string, createdAt time.Time) {
-	event := archiveEvent{room: room, userID: userID, content: content, createdAt: createdAt}
+	event := archiveEvent{
+		eventID:   middleware.GenerateRequestID(),
+		room:      room,
+		userID:    userID,
+		content:   content,
+		createdAt: createdAt,
+	}
 
 	select {
 	case d.archiveQ <- event:
 	default:
 		slog.Error("chat message dropped: archive queue full",
+			"service", "chat-service", "room", room, "user_id", userID)
+	}
+
+	if d.notificationClient == nil {
+		return
+	}
+
+	select {
+	case d.notifyQ <- event:
+	default:
+		// Less severe than a lost archive row: the message is still in the
+		// room and (probably) in the database; only the offline fan-out is
+		// lost.
+		slog.Warn("message event dropped: notify queue full",
 			"service", "chat-service", "room", room, "user_id", userID)
 	}
 }
@@ -200,6 +251,48 @@ func (d *Dispatcher) handleArchive(event archiveEvent) {
 	if err != nil {
 		slog.Error("failed to archive chat message",
 			"service", "chat-service", "room", event.room, "user_id", event.userID, "error", err)
+	}
+}
+
+func (d *Dispatcher) runNotifyWorker() {
+	defer d.wg.Done()
+
+	for {
+		select {
+		case <-d.stop:
+			d.drainNotify()
+			return
+		case event := <-d.notifyQ:
+			d.handleNotify(event, notifyEventTimeout)
+		}
+	}
+}
+
+func (d *Dispatcher) drainNotify() {
+	for {
+		select {
+		case event := <-d.notifyQ:
+			d.handleNotify(event, notifyDrainTimeout)
+		default:
+			return
+		}
+	}
+}
+
+func (d *Dispatcher) handleNotify(event archiveEvent, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	err := d.notificationClient.SendMessageEvent(ctx, domain.MessageEvent{
+		EventID:   event.eventID,
+		Room:      event.room,
+		UserID:    event.userID,
+		Content:   event.content,
+		CreatedAt: event.createdAt,
+	})
+	if err != nil {
+		slog.Error("message event delivery failed after retries",
+			"service", "chat-service", "room", event.room, "event_id", event.eventID, "error", err)
 	}
 }
 

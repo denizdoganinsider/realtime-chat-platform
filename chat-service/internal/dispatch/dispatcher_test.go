@@ -69,7 +69,7 @@ func (c *blockingCreator) count() int {
 func TestNotifyAndArchiveNeverBlock(t *testing.T) {
 	sender := newBlockingSender()
 	creator := newBlockingCreator()
-	d := NewDispatcher(sender, creator)
+	d := NewDispatcher(sender, creator, nil)
 	defer func() {
 		close(sender.release)
 		close(creator.release)
@@ -97,7 +97,7 @@ func TestNotifyAndArchiveNeverBlock(t *testing.T) {
 func TestCloseDrainsQueuedEvents(t *testing.T) {
 	sender := newBlockingSender()
 	creator := newBlockingCreator()
-	d := NewDispatcher(sender, creator)
+	d := NewDispatcher(sender, creator, nil)
 
 	const queued = 5
 	for i := range queued {
@@ -126,7 +126,7 @@ func TestEnqueueAfterCloseDoesNotPanic(t *testing.T) {
 	close(sender.release)
 	close(creator.release)
 
-	d := NewDispatcher(sender, creator)
+	d := NewDispatcher(sender, creator, nil)
 	d.Close(time.Second)
 
 	d.Notify("general", 1, domain.PresenceStatusOffline)
@@ -139,7 +139,66 @@ func TestCloseIsIdempotent(t *testing.T) {
 	close(sender.release)
 	close(creator.release)
 
-	d := NewDispatcher(sender, creator)
+	d := NewDispatcher(sender, creator, nil)
 	d.Close(time.Second)
 	d.Close(time.Second)
+}
+
+type recordingEventSender struct {
+	mu     sync.Mutex
+	events []domain.MessageEvent
+}
+
+func (s *recordingEventSender) SendMessageEvent(ctx context.Context, event domain.MessageEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *recordingEventSender) snapshot() []domain.MessageEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.MessageEvent(nil), s.events...)
+}
+
+// One Archive call, two consumers: the database write and the message event
+// to notification-service, each carrying the same id and timestamp.
+func TestArchiveAlsoEmitsAMessageEvent(t *testing.T) {
+	creator := newBlockingCreator()
+	close(creator.release)
+	sender := &recordingEventSender{}
+
+	d := NewDispatcher(newBlockingSender(), creator, sender)
+	defer d.Close(time.Second)
+
+	stamped := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	d.Archive("general", 7, "hello", stamped)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if events := sender.snapshot(); len(events) == 1 {
+			e := events[0]
+			if e.Room != "general" || e.UserID != 7 || e.Content != "hello" || !e.CreatedAt.Equal(stamped) {
+				t.Errorf("event = %+v", e)
+			}
+			if len(e.EventID) != 32 {
+				t.Errorf("EventID = %q, want a 32-hex id", e.EventID)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no message event was emitted")
+}
+
+// A nil notification client means no events leave the process - and no panic.
+func TestArchiveWithoutNotificationClient(t *testing.T) {
+	creator := newBlockingCreator()
+	close(creator.release)
+
+	d := NewDispatcher(newBlockingSender(), creator, nil)
+	defer d.Close(time.Second)
+
+	d.Archive("general", 7, "hello", time.Now())
 }

@@ -24,6 +24,9 @@ type Config struct {
 	PresenceAPIKey        string
 	PresenceHeartbeatSecs int
 
+	NotificationServiceURL string
+	NotificationAPIKey     string
+
 	WSAllowedOrigins []string
 }
 
@@ -57,6 +60,9 @@ func LoadConfig() *Config {
 		PresenceServiceURL:    getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
 		PresenceAPIKey:        requireEnv("PRESENCE_API_KEY"),
 		PresenceHeartbeatSecs: getEnvInt("PRESENCE_HEARTBEAT_SECONDS", 30),
+
+		NotificationServiceURL: getEnv("NOTIFICATION_SERVICE_URL", "http://localhost:8003"),
+		NotificationAPIKey:     requireEnv("NOTIFICATION_API_KEY"),
 
 		WSAllowedOrigins: getEnvList("WS_ALLOWED_ORIGINS", []string{"http://localhost:3000", "http://localhost:8000"}),
 	}

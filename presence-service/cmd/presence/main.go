@@ -52,6 +52,10 @@ func main() {
 	internal.Use(presenceMiddleware.APIKeyMiddleware)
 	internal.POST("/events", presenceController.RecordEvent)
 	internal.POST("/heartbeat", presenceController.Heartbeat)
+	// The same read as /presence/:room, for a service (notification-service)
+	// deciding who is offline: there is no end user behind that decision, so
+	// it authenticates with the key, not a token.
+	internal.GET("/internal/presence/:room", presenceController.GetRoom)
 
 	// End-user read path: the same Bearer token as /me and /rooms, validated
 	// here independently against the shared JWT_SECRET.

@@ -18,6 +18,7 @@ services:
       # it to an already-initialised volume without losing registered users.
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-gateway.sql
       - ./db/chat_schema.sql:/docker-entrypoint-initdb.d/02-chat.sql
+      - ./db/notification_schema.sql:/docker-entrypoint-initdb.d/03-notification.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 5s
