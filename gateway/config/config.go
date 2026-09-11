@@ -8,17 +8,26 @@ import (
 )
 
 type Config struct {
-	DBHost             string
-	DBPort             string
-	DBUser             string
-	DBPassword         string
-	DBName             string
-	JWTSecret          string
-	ServerPort         string
-	ChatServiceURLs    []string
-	PresenceServiceURL string
+	DBHost                 string
+	DBPort                 string
+	DBUser                 string
+	DBPassword             string
+	DBName                 string
+	JWTSecret              string
+	ServerPort             string
+	ChatServiceURLs        []string
+	PresenceServiceURL     string
+	NotificationServiceURL string
+	MediaServiceURL        string
 
 	LBHealthIntervalSecs int
+
+	// Proves to notification-service and media-service that a request came
+	// through here; they trust the X-User-ID it travels with on that basis.
+	GatewayKey string
+
+	EdgeCacheMaxBytes  int64
+	EdgeCacheMaxObject int64
 }
 
 func LoadConfig() *Config {
@@ -34,9 +43,16 @@ func LoadConfig() *Config {
 		// month 3, where the gateway load-balances across them.
 		ChatServiceURLs: getEnvList("CHAT_SERVICE_URLS", []string{"http://localhost:8001"}),
 
-		PresenceServiceURL: getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
+		PresenceServiceURL:     getEnv("PRESENCE_SERVICE_URL", "http://localhost:8002"),
+		NotificationServiceURL: getEnv("NOTIFICATION_SERVICE_URL", "http://localhost:8003"),
+		MediaServiceURL:        getEnv("MEDIA_SERVICE_URL", "http://localhost:8004"),
 
 		LBHealthIntervalSecs: getEnvInt("LB_HEALTH_INTERVAL_SECONDS", 5),
+
+		GatewayKey: requireEnv("GATEWAY_SHARED_KEY"),
+
+		EdgeCacheMaxBytes:  int64(getEnvInt("EDGE_CACHE_MAX_BYTES", 64<<20)),
+		EdgeCacheMaxObject: int64(getEnvInt("EDGE_CACHE_MAX_OBJECT_BYTES", 5<<20)),
 	}
 }
 

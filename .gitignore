@@ -1,2 +1,4 @@
 *.log
 .DS_Store
+# media-service local disk store
+media-service/data/

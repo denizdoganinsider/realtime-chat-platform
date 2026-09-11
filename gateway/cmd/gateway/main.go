@@ -12,6 +12,7 @@ import (
 
 	"realtime-chat-platform/gateway/config"
 	"realtime-chat-platform/gateway/internal/controller"
+	"realtime-chat-platform/gateway/internal/edgecache"
 	"realtime-chat-platform/gateway/internal/loadbalancer"
 	"realtime-chat-platform/gateway/internal/proxy"
 	"realtime-chat-platform/gateway/internal/repository"
@@ -62,6 +63,25 @@ func main() {
 		slog.Error("failed to build presence-service proxy", "error", err)
 		os.Exit(1)
 	}
+
+	// Month 4 services take the gateway's word for who the user is (edge
+	// auth) instead of carrying a fourth and fifth copy of jwt.go.
+	notificationProxy, err := proxy.NewTrustedProxy(cfg.NotificationServiceURL, cfg.GatewayKey)
+	if err != nil {
+		slog.Error("failed to build notification-service proxy", "error", err)
+		os.Exit(1)
+	}
+
+	mediaUploadProxy, err := proxy.NewTrustedProxy(cfg.MediaServiceURL, cfg.GatewayKey)
+	if err != nil {
+		slog.Error("failed to build media-service proxy", "error", err)
+		os.Exit(1)
+	}
+
+	// The CDN edge: reads of shared media are served from memory here and go
+	// to media-service only on a miss.
+	mediaCache := edgecache.New(cfg.EdgeCacheMaxBytes, cfg.EdgeCacheMaxObject)
+	mediaEdge := edgecache.NewHandler(mediaCache, cfg.MediaServiceURL)
 
 	e := echo.New()
 
@@ -122,6 +142,23 @@ func main() {
 	// that per-instance view is how the verification proves stickiness.
 	auth.GET("/rooms", presenceProxy)
 	auth.GET("/presence/:room", presenceProxy)
+
+	// notification-service: a user's webhook endpoint, room subscriptions and
+	// delivery log. All end-user paths, all behind the token, identity
+	// forwarded as X-User-ID.
+	auth.PUT("/webhook", notificationProxy)
+	auth.GET("/webhook", notificationProxy)
+	auth.DELETE("/webhook", notificationProxy)
+	auth.POST("/subscriptions", notificationProxy)
+	auth.GET("/subscriptions", notificationProxy)
+	auth.DELETE("/subscriptions/:room", notificationProxy)
+	auth.GET("/deliveries", notificationProxy)
+
+	// media-service. Uploads need a user; reads are public and content
+	// addressed, so they are served by the edge cache rather than proxied.
+	auth.POST("/media", mediaUploadProxy)
+	e.GET("/media/:hash", mediaEdge.Serve)
+	auth.GET("/health/edge-cache", mediaEdge.Stats)
 
 	go func() {
 		if err := e.Start(fmt.Sprintf(":%s", cfg.ServerPort)); err != nil && err != http.ErrServerClosed {

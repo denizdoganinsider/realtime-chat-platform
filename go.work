@@ -3,5 +3,7 @@ go 1.26.1
 use (
 	./chat-service
 	./gateway
+	./media-service
+	./notification-service
 	./presence-service
 )

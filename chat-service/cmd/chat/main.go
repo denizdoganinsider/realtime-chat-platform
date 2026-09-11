@@ -38,11 +38,12 @@ func main() {
 	messageController := controller.NewMessageController(messageService)
 
 	presenceClient := service.NewPresenceClient(cfg.PresenceServiceURL, cfg.PresenceAPIKey, cfg.InstanceID)
+	notificationClient := service.NewNotificationClient(cfg.NotificationServiceURL, cfg.NotificationAPIKey)
 
 	// Deferred calls run last-in-first-out, so this reads bottom-up at exit: the
 	// hub stops first, then the heartbeat, then the dispatcher drains whatever
 	// the rooms queued on their way out.
-	dispatcher := dispatch.NewDispatcher(presenceClient, messageService)
+	dispatcher := dispatch.NewDispatcher(presenceClient, messageService, notificationClient)
 	defer dispatcher.Close(5 * time.Second)
 
 	hub := ws.NewHub(dispatcher, dispatcher)
